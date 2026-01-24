@@ -223,10 +223,11 @@ function auth_require_or_render_login(): void {
       </div>
     </div>
   </div>
-<footer><?= htmlspecialchars(APP_TITLE) ?> V.1.0 © 2026 von Kevin Tobler - <a href='https://kevintobler.ch' target='_blank'>www.kevintobler.ch</a></footer>
+<footer><?= htmlspecialchars(APP_TITLE) ?> V.1.0 © 2026 by Kevin Tobler - <a href='https://kevintobler.ch' target='_blank'>www.kevintobler.ch</a></footer>
 </body>
 </html>
 <?php
   exit;
 }
+
 auth_require_or_render_login();
