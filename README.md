@@ -40,9 +40,9 @@ Version **1.0** – developed by Kevin Tobler 🌐 [www.kevintobler.ch](https:/
 
 ---
 
-## 🐳 Docker Installation (Version 3.1)
+## 🐳 Docker Installation (Version 1.0)
 
-Dropzone File Sharing **V.3.1** is available as a Docker image:
+Dropzone File Explorer **V.1.0** is available as a Docker image:
 
 ```bash
 docker pull keepcoolch/dropzonefileexplorer:latest
