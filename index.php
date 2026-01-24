@@ -302,10 +302,11 @@ auth_require_or_render_login();
 </div>
 <div class="spacer"></div>
 <div class="toast" id="toast"></div>
-<footer><?= htmlspecialchars(APP_TITLE) ?> V.1.0 © 2026 von Kevin Tobler - <a href='https://kevintobler.ch' target='_blank'>www.kevintobler.ch</a></footer>
+<footer><?= htmlspecialchars(APP_TITLE) ?> V.1.0 © 2026 by Kevin Tobler - <a href='https://kevintobler.ch' target='_blank'>www.kevintobler.ch</a></footer>
 <script>
   window.APP_CONFIG = { CHUNK_SIZE: <?= (int)CHUNK_SIZE_DEFAULT ?> };
 </script>
 <script src="js/main.js" defer></script>
 </body>
 </html>
+
