@@ -809,7 +809,17 @@ if ($action === 'shareCreate') {
   $t = token();
   $db[$t] = ['path'=>$rel, 'created'=>time()];
   shares_save($db);
-  $url = (BASE_URL !== '' ? BASE_URL : (isset($_SERVER['HTTPS']) ? 'https://' : 'http://') . $_SERVER['HTTP_HOST'] . strtok($_SERVER['REQUEST_URI'], '?')) . '?share=' . $t;
+  $scheme =
+  (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+  || (!empty($_SERVER['SERVER_PORT']) && (int)$_SERVER['SERVER_PORT'] === 443)
+  || (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower($_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https')
+  || (!empty($_SERVER['HTTP_X_FORWARDED_SSL']) && strtolower($_SERVER['HTTP_X_FORWARDED_SSL']) === 'on')
+    ? 'https'
+    : 'http';
+  $base = (BASE_URL !== '')
+    ? rtrim(BASE_URL, '/')
+    : $scheme . '://' . $_SERVER['HTTP_HOST'];
+  $url = $base . strtok($_SERVER['REQUEST_URI'], '?') . '?share=' . $t;
   jsend(['ok'=>true,'token'=>$t,'url'=>$url]);
 }
 
@@ -824,7 +834,16 @@ if ($action === 'shareRevoke') {
 // --- SHARE LIST ---
 if ($action === 'shareList') {
   $db = shares_db();
-  $base = (BASE_URL !== '' ? BASE_URL : ((isset($_SERVER['HTTPS']) ? 'https://' : 'http://') . $_SERVER['HTTP_HOST'] . strtok($_SERVER['REQUEST_URI'], '?')));
+  $scheme =
+  (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+  || (!empty($_SERVER['SERVER_PORT']) && (int)$_SERVER['SERVER_PORT'] === 443)
+  || (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower($_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https')
+  || (!empty($_SERVER['HTTP_X_FORWARDED_SSL']) && strtolower($_SERVER['HTTP_X_FORWARDED_SSL']) === 'on')
+    ? 'https'
+    : 'http';
+  $base = (BASE_URL !== '')
+    ? rtrim(BASE_URL, '/')
+    : $scheme . '://' . $_SERVER['HTTP_HOST'] . strtok($_SERVER['REQUEST_URI'], '?');
   $out = [];
   foreach ($db as $token => $entry) {
     $rel = norm_rel((string)($entry['path'] ?? ''));
