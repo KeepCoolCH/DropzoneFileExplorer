@@ -233,22 +233,32 @@ function detect_mime(string $abs): string {
 }
 
 function zip_cli(string $zipAbs, array $absPaths): void {
+  $root = realpath(ROOT_DIR);
+  if ($root === false) {
+    throw new RuntimeException('ROOT_DIR invalid');
+  }
   $zipAbs = escapeshellarg($zipAbs);
   if (trim(shell_exec('command -v bsdtar'))) {
-    $cmd = "bsdtar -cf $zipAbs";
+    $cmd = "bsdtar -cf $zipAbs -C " . escapeshellarg($root);
     foreach ($absPaths as $p) {
-      $p = realpath($p);
-      $cmd .= " -C " . escapeshellarg(dirname($p)) . " " . escapeshellarg(basename($p));
+      $real = realpath($p);
+      if ($real === false || strpos($real, $root . DIRECTORY_SEPARATOR) !== 0) {
+        throw new RuntimeException('Path outside ROOT_DIR');
+      }
+      $rel = ltrim(substr($real, strlen($root)), DIRECTORY_SEPARATOR);
+      $cmd .= " " . escapeshellarg($rel);
     }
   } else {
-    $cmd = "zip -0 -r $zipAbs";
+    $cmd = "cd " . escapeshellarg($root) . " && zip -0 -r $zipAbs";
     foreach ($absPaths as $p) {
-      $cmd .= " " . escapeshellarg($p);
+      $real = realpath($p);
+      $rel  = ltrim(substr($real, strlen($root)), DIRECTORY_SEPARATOR);
+      $cmd .= " " . escapeshellarg($rel);
     }
   }
   exec($cmd . " 2>&1", $out, $rc);
   if ($rc !== 0) {
-    throw new RuntimeException("ZIP CLI failed: " . implode("\n", $out));
+    throw new RuntimeException("ZIP CLI failed:\n" . implode("\n", $out));
   }
 }
 
