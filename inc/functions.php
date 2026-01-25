@@ -232,17 +232,23 @@ function detect_mime(string $abs): string {
   return $m ?: 'application/octet-stream';
 }
 
-function zip_add_path_store(ZipArchive $zip, string $absPath, string $zipPath): void {
-  if (is_dir($absPath)) {
-    $zip->addEmptyDir(rtrim($zipPath, '/') . '/');
-    $it = new DirectoryIterator($absPath);
-    foreach ($it as $f) {
-      if ($f->isDot()) continue;
-      zip_add_path_store($zip, $absPath . DIRECTORY_SEPARATOR . $f->getFilename(), rtrim($zipPath,'/') . '/' . $f->getFilename());
+function zip_cli(string $zipAbs, array $absPaths): void {
+  $zipAbs = escapeshellarg($zipAbs);
+  if (trim(shell_exec('command -v bsdtar'))) {
+    $cmd = "bsdtar -cf $zipAbs";
+    foreach ($absPaths as $p) {
+      $p = realpath($p);
+      $cmd .= " -C " . escapeshellarg(dirname($p)) . " " . escapeshellarg(basename($p));
     }
   } else {
-    $zip->addFile($absPath, $zipPath);
-    @ $zip->setCompressionName($zipPath, ZipArchive::CM_STORE);
+    $cmd = "zip -0 -r $zipAbs";
+    foreach ($absPaths as $p) {
+      $cmd .= " " . escapeshellarg($p);
+    }
+  }
+  exec($cmd . " 2>&1", $out, $rc);
+  if ($rc !== 0) {
+    throw new RuntimeException("ZIP CLI failed: " . implode("\n", $out));
   }
 }
 
@@ -275,27 +281,17 @@ if (isset($_GET['share'])) {
     http_response_code(404); echo 'Gone'; exit;
   }
 
-// If folder => stream zip STORE
+// If folder => Zip
 if (is_dir($abs)) {
-  if (!class_exists('ZipArchive')) { http_response_code(500); echo 'ZipArchive missing'; exit; }
   $name = basename($abs) ?: 'download';
   $tmpDir = STORAGE_DIR . '/tmp';
   if (!is_dir($tmpDir)) @mkdir($tmpDir, 0775, true);
   $tmp = $tmpDir . '/sharezip_' . bin2hex(random_bytes(8)) . '.zip';
-  $zip = new ZipArchive();
-  $rc = $zip->open($tmp, ZipArchive::CREATE | ZipArchive::OVERWRITE);
-  if ($rc !== true) {
+  try {
+    zip_cli($tmp, [$abs]);
+  } catch (Throwable $e) {
     http_response_code(500);
-    echo 'Zip open failed: ' . $rc;
-    exit;
-  }
-  zip_add_path_store($zip, $abs, $name);
-  $zip->close();
-
-  if (!is_file($tmp) || filesize($tmp) === 0) {
-    @unlink($tmp);
-    http_response_code(500);
-    echo 'Zip is empty or missing';
+    echo 'ZIP creation failed';
     exit;
   }
 
@@ -567,54 +563,69 @@ if ($action === 'copy') {
 
 // --- ZIP CREATE ---
 if ($action === 'zipCreate') {
+  set_time_limit(0);
   $paths = $body['paths'] ?? [];
-  if (!is_array($paths) || !$paths) jsend(['ok'=>false,'error'=>'No paths'], 400);
-  if (!class_exists('ZipArchive')) jsend(['ok'=>false,'error'=>'ZipArchive missing (PHP extension)'], 500);
+  if (!is_array($paths) || !$paths) {
+    jsend(['ok'=>false,'error'=>'No paths'], 400);
+  }
+
   $destDir = norm_rel((string)($body['destDir'] ?? ''));
   $destAbs = abs_path($destDir);
   ensure_inside_root($destAbs);
-  if (!is_dir($destAbs)) jsend(['ok'=>false,'error'=>'Destination is not a folder'], 400);
-  $zipName = (string)($body['name'] ?? 'archive');
-  $zipName = trim($zipName);
+  if (!is_dir($destAbs)) {
+    jsend(['ok'=>false,'error'=>'Destination is not a folder'], 400);
+  }
+
+  // --- ZIP NAME ---
+  $zipName = trim((string)($body['name'] ?? 'archive'));
   $zipName = preg_replace('~[\\\\/:*?"<>|]+~', '_', $zipName);
   if ($zipName === '') $zipName = 'archive';
   if (!preg_match('~\.zip$~i', $zipName)) $zipName .= '.zip';
+
+  // --- POLICY ---
   $policy = (string)($body['policy'] ?? 'rename');
-  if (!in_array($policy, ['overwrite','rename','ask'], true)) $policy = 'rename';
+  if (!in_array($policy, ['overwrite','rename','ask'], true)) {
+    $policy = 'rename';
+  }
   $finalName = $zipName;
-  $finalAbs = $destAbs . DIRECTORY_SEPARATOR . $finalName;
+  $finalAbs  = $destAbs . DIRECTORY_SEPARATOR . $finalName;
   if (file_exists($finalAbs)) {
     if ($policy === 'overwrite') {
+      // ok
     } elseif ($policy === 'rename') {
       $finalName = unique_name($destAbs, $finalName);
-      $finalAbs = $destAbs . DIRECTORY_SEPARATOR . $finalName;
+      $finalAbs  = $destAbs . DIRECTORY_SEPARATOR . $finalName;
     } else {
       jsend(['ok'=>false,'needsChoice'=>true,'error'=>'ZIP exists'], 409);
     }
   }
-  $zip = new ZipArchive();
-  $openRes = $zip->open($finalAbs, ZipArchive::CREATE | ZipArchive::OVERWRITE);
-  if ($openRes !== true) {
-    jsend(['ok'=>false,'error'=>'Zip open failed','detail'=>'ZipArchive::open returned '.$openRes], 500);
-  }
-  try {
-    foreach ($paths as $rel) {
-      $rel = norm_rel((string)$rel);
-      if ($rel === '') continue;
 
-      $abs = abs_path($rel);
-      ensure_inside_root($abs);
-      if (!file_exists($abs)) continue;
-
-      $base = basename($abs) ?: 'item';
-      zip_add_path_store($zip, $abs, $base);
+  // --- BUILD ABS PATH LIST ---
+  $absList = [];
+  foreach ($paths as $rel) {
+    $rel = norm_rel((string)$rel);
+    if ($rel === '') continue;
+    $abs = abs_path($rel);
+    ensure_inside_root($abs);
+    if (file_exists($abs)) {
+      $absList[] = $abs;
     }
-  } catch (Throwable $e) {
-    $zip->close();
-    @unlink($finalAbs);
-    jsend(['ok'=>false,'error'=>'Zip build failed','detail'=>$e->getMessage()], 500);
   }
-  $zip->close();
+  if (!$absList) {
+    jsend(['ok'=>false,'error'=>'Nothing to zip'], 400);
+  }
+
+  // --- CLI ZIP ---
+  try {
+    zip_cli($finalAbs, $absList);
+  } catch (Throwable $e) {
+    @unlink($finalAbs);
+    jsend([
+      'ok'=>false,
+      'error'=>'ZIP creation failed',
+      'detail'=>$e->getMessage()
+    ], 500);
+  }
   if (!is_file($finalAbs) || filesize($finalAbs) === 0) {
     @unlink($finalAbs);
     jsend(['ok'=>false,'error'=>'Zip is empty or missing'], 500);
@@ -1055,6 +1066,7 @@ if ($action === 'uploadAbort') {
 
 // --- DOWNLOAD PREPARE ---
 if ($action === 'downloadPrepare') {
+  set_time_limit(0);
   downloads_gc();
 $paths = array_values(array_filter(
   (array)($body['paths'] ?? []),
@@ -1080,9 +1092,6 @@ if ($paths) {
   }
   $absList = [$abs];
 }
-  if (!class_exists('ZipArchive')) {
-    jsend(['ok'=>false,'error'=>'ZipArchive missing'], 500);
-  }
 if ($paths) {
   $folder = 'selection';
 } else {
@@ -1091,43 +1100,34 @@ if ($paths) {
     $folder = 'dl';
   }
 }
-  $tmpDir = STORAGE_DIR.'/tmp';
-  if (!is_dir($tmpDir)) @mkdir($tmpDir, 0775, true);
-  $tok = token(18);
-  $tmp = "$tmpDir/dl_$tok.zip";
-  $zip = new ZipArchive();
-  if ($zip->open($tmp, ZipArchive::CREATE|ZipArchive::OVERWRITE) !== true) {
-    jsend(['ok'=>false,'error'=>'Cannot create zip'], 500);
-  }
-  try {
-    $rootName = $paths ? 'selection' : (basename($abs) ?: 'folder');
-    foreach ($absList as $a) {
-      $name = basename($a);
-      if (count($absList) === 1) {
-        zip_add_path_store($zip, $a, $name);
-      } else {
-        zip_add_path_store($zip, $a, 'selection/' . $name);
-      }
-    }
-  } catch (Throwable $e) {
-    $zip->close();
-    @unlink($tmp);
-    jsend(['ok'=>false,'error'=>'Zip build failed','detail'=>$e->getMessage()], 500);
-  }
-  $zip->close();
-  $db = downloads_db();
-  $db[$tok] = [
-    'tmp' => $tmp,
-    'name' => $folder.'_'.bin2hex(random_bytes(6)).'.zip',
-    'created' => time(),
-  ];
-  downloads_save($db);
-  jsend(['ok'=>true,'kind'=>'dir','token'=>$tok,'name'=>$db[$tok]['name']]);
+$tmpDir = STORAGE_DIR.'/tmp';
+if (!is_dir($tmpDir)) @mkdir($tmpDir, 0775, true);
+$tok = token(18);
+$tmp = "$tmpDir/dl_$tok.zip";
+try {
+  zip_cli($tmp, $absList);
+} catch (Throwable $e) {
+  @unlink($tmp);
+  jsend([
+    'ok' => false,
+    'error' => 'ZIP creation failed',
+    'detail' => $e->getMessage()
+  ], 500);
+}
+$db = downloads_db();
+$db[$tok] = [
+  'tmp' => $tmp,
+  'name' => ($folder ?? 'download') . '_' . bin2hex(random_bytes(6)) . '.zip',
+  'created' => time(),
+];
+downloads_save($db);
+jsend(['ok' => true, 'kind' => 'dir', 'token' => $tok, 'name' => $db[$tok]['name']]);
 }
 
 // --- DOWNLOAD ---
 if ($action === 'download') {
-$dl = preg_replace('~[^a-zA-Z0-9_\-]~', '', (string)($_GET['dl'] ?? ''));
+  set_time_limit(0);
+  $dl = preg_replace('~[^a-zA-Z0-9_\-]~', '', (string)($_GET['dl'] ?? ''));
 if ($dl !== '') {
   downloads_gc();
   $db = downloads_db();
@@ -1147,37 +1147,35 @@ if ($dl !== '') {
   downloads_save($db);
   exit;
 }
+  $rel = norm_rel((string)($_GET['path'] ?? ''));
+  $abs = abs_path($rel);
+  ensure_inside_root($abs);
+  if (!file_exists($abs)) {
+    http_response_code(404);
+    exit;
+  }
+  while (ob_get_level()) { ob_end_clean(); }
 
-    if (!class_exists('ZipArchive')) {
-    }
-    $rel = norm_rel((string)($_GET['path'] ?? ''));
-    $abs = abs_path($rel);
-    ensure_inside_root($abs);
-    if (!file_exists($abs)) {
-      http_response_code(404);
-      exit;
-    }
-    while (ob_get_level()) { ob_end_clean(); }
-
-    if (is_dir($abs)) {
-      if (!class_exists('ZipArchive')) jsend(['ok'=>false,'error'=>'ZipArchive missing'], 500);
-      $folderName = basename($abs) ?: 'folder';
-      $tmpDir = STORAGE_DIR . '/tmp';
-      if (!is_dir($tmpDir)) @mkdir($tmpDir, 0775, true);
-      $tmp = $tmpDir . '/folderzip_' . bin2hex(random_bytes(8)) . '.zip';
-      $zip = new ZipArchive();
-      $rc = $zip->open($tmp, ZipArchive::CREATE | ZipArchive::OVERWRITE);
-      if ($rc !== true) jsend(['ok'=>false,'error'=>'Cannot create zip','detail'=>'ZipArchive::open returned '.$rc], 500);
-      zip_add_path_store($zip, $abs, $folderName);
-      $zip->close();
-      header('Content-Type: application/zip');
-      header('Content-Disposition: attachment; filename="'.rawurlencode($folderName).'.zip"');
-      header('Content-Length: '.filesize($tmp));
-      header('X-Accel-Buffering: no');
-      readfile($tmp);
-      @unlink($tmp);
-      exit;
-    }
+if (is_dir($abs)) {
+  $folderName = basename($abs) ?: 'folder';
+  $tmpDir = STORAGE_DIR . '/tmp';
+  if (!is_dir($tmpDir)) @mkdir($tmpDir, 0775, true);
+  $tmp = $tmpDir . '/folderzip_' . bin2hex(random_bytes(8)) . '.zip';
+  try {
+    zip_cli($tmp, [$abs]);
+  } catch (Throwable $e) {
+    http_response_code(500);
+    echo 'ZIP creation failed';
+    exit;
+  }
+  header('Content-Type: application/zip');
+  header('Content-Disposition: attachment; filename="'.rawurlencode($folderName).'.zip"');
+  header('Content-Length: '.filesize($tmp));
+  header('X-Accel-Buffering: no');
+  readfile($tmp);
+  @unlink($tmp);
+  exit;
+}
 
     // --- File => stream as attachment ---
     $mime = detect_mime($abs);
