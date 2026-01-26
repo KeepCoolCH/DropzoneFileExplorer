@@ -233,13 +233,15 @@ function detect_mime(string $abs): string {
 }
 
 function zip_cli(string $zipAbs, array $absPaths): void {
+ignore_user_abort(true);
+set_time_limit(0);
   $root = realpath(ROOT_DIR);
   if ($root === false) {
     throw new RuntimeException('ROOT_DIR invalid');
   }
   $zipAbs = escapeshellarg($zipAbs);
   if (trim(shell_exec('command -v bsdtar'))) {
-    $cmd = "bsdtar -cf $zipAbs -C " . escapeshellarg($root);
+    $cmd = "bsdtar -cf $zipAbs --format=zip" . " --exclude=.DS_Store" . " --exclude=._*" . " --exclude=__MACOSX" . " --exclude=Thumbs.db" . " -C " . escapeshellarg($root);
     foreach ($absPaths as $p) {
       $real = realpath($p);
       if ($real === false || strpos($real, $root . DIRECTORY_SEPARATOR) !== 0) {
@@ -249,7 +251,7 @@ function zip_cli(string $zipAbs, array $absPaths): void {
       $cmd .= " " . escapeshellarg($rel);
     }
   } else {
-    $cmd = "cd " . escapeshellarg($root) . " && zip -0 -r $zipAbs";
+    $cmd = "cd " . escapeshellarg($root) . " && zip -0 -r $zipAbs" . " -x '*.DS_Store' '._*' '__MACOSX/*' 'Thumbs.db'";
     foreach ($absPaths as $p) {
       $real = realpath($p);
       $rel  = ltrim(substr($real, strlen($root)), DIRECTORY_SEPARATOR);
@@ -257,7 +259,7 @@ function zip_cli(string $zipAbs, array $absPaths): void {
     }
   }
   exec($cmd . " 2>&1", $out, $rc);
-  if ($rc !== 0) {
+  if ($rc !== 0 || !is_file(trim($zipAbs, "'"))) {
     throw new RuntimeException("ZIP CLI failed:\n" . implode("\n", $out));
   }
 }
