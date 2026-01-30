@@ -9,6 +9,29 @@ function jsend(array $data, int $code = 200): void {
   exit;
 }
 
+// -------------------- FILE EXCLUDES --------------------
+const FILE_EXCLUDES = [
+    '.DS_Store',
+    '__MACOSX',
+    'Thumbs.db',
+];
+
+const FILE_EXCLUDE_PREFIXES = [
+    '._',          // AppleDouble files
+];
+
+function is_excluded_file(string $name): bool {
+    if (in_array($name, FILE_EXCLUDES, true)) {
+        return true;
+    }
+    foreach (FILE_EXCLUDE_PREFIXES as $prefix) {
+        if (str_starts_with($name, $prefix)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 function norm_rel(string $rel): string {
   $rel = str_replace("\0", '', $rel);
   $rel = str_replace('\\', '/', $rel);
@@ -67,6 +90,7 @@ function list_dir(string $rel): array {
   if (!$dh) jsend(['ok'=>false,'error'=>'Cannot open dir'], 500);
   while (($name = readdir($dh)) !== false) {
     if ($name === '.' || $name === '..') continue;
+    if (is_excluded_file($name)) continue;
     $p = $abs . DIRECTORY_SEPARATOR . $name;
     $isDir = is_dir($p);
     $stat = @stat($p);
@@ -95,6 +119,7 @@ function build_tree(string $rel = ''): array {
   if (!$dh) return [];
   while (($name = readdir($dh)) !== false) {
     if ($name === '.' || $name === '..') continue;
+    if (is_excluded_file($name)) continue;
     $p = $abs . DIRECTORY_SEPARATOR . $name;
     if (!is_dir($p)) continue;
     $childRel = norm_rel(($rel === '' ? '' : $rel.'/') . $name);
@@ -117,6 +142,7 @@ function has_dir_children(string $rel): bool {
   if (!$dh) return false;
   while (($name = readdir($dh)) !== false) {
     if ($name === '.' || $name === '..') continue;
+    if (is_excluded_file($name)) continue;
     if (is_dir($abs . DIRECTORY_SEPARATOR . $name)) { closedir($dh); return true; }
   }
   closedir($dh);
@@ -150,6 +176,7 @@ function rrcopy(string $src, string $dst): void {
     $it = new DirectoryIterator($src);
     foreach ($it as $f) {
       if ($f->isDot()) continue;
+      if (is_excluded_file($f->getFilename())) continue;
       rrcopy($src . DIRECTORY_SEPARATOR . $f->getFilename(), $dst . DIRECTORY_SEPARATOR . $f->getFilename());
     }
   } else {
