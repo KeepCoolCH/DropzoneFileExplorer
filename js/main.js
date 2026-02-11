@@ -45,7 +45,6 @@ function sortItems(arr) {
 }
 
 // ---------------- Chunk Size ----------------
-(() => {
 const CHUNK_SIZE =
   Number(window.APP_CONFIG?.CHUNK_SIZE) || (2 * 1024 * 1024);
 
@@ -56,6 +55,21 @@ const elCrumbs = document.getElementById('crumbs');
 const elPathInfo = document.getElementById('pathInfo');
 const elListBody = document.querySelector('#list tbody');
 const elListTable = document.getElementById('list');
+
+// ---------------- Reload Explorer ----------------
+async function reloadExplorerFull() {
+  try {
+    showSpinner();
+    elStatus.textContent = 'Reloading…';
+    await openDir(cwd);
+    setTimeout(refreshRootSize, 50);
+    showToast('Reloaded');
+  } catch (e) {
+    showToast('Reload failed');
+  } finally {
+    hideSpinner();
+  }
+}
 
 // ---------------- List Sorting (Header Clicks) ----------------
 document.querySelectorAll('#list thead th[data-sort]').forEach(th => {
@@ -162,9 +176,15 @@ const fmtSize = (n) => {
   return (i===0 ? n.toFixed(0) : n.toFixed(1))+' '+u[i];
 };
 const fmtTime = (ts) => {
-  if(!ts) return '—';
-  const d = new Date(ts*1000);
-  return d.toLocaleString();
+  if (!ts) return '—';
+  return new Date(ts * 1000).toLocaleString('de-CH', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
 };
 
 let cwd = '';
@@ -174,6 +194,27 @@ let lastClicked = null;
 let currentPreview = null;
 let hoverDest = null;
 const expandedTreeNodes = new Set();
+
+// ---------------- PATH HELPERS ----------------
+function parentDir(path){
+  if (!path) return '';
+  const i = path.lastIndexOf('/');
+  return i === -1 ? '' : path.slice(0, i);
+}
+
+function isSameOrChild(dest, src){
+  if (!src) return false;
+  return dest === src || dest.startsWith(src + '/');
+}
+
+function fixCwdAfterMove(paths, dest) {
+  for (const p of paths) {
+    if (cwd === p || cwd.startsWith(p + '/')) {
+      cwd = dest;
+      return;
+    }
+  }
+}
 
 // ---------------- HELPERS ----------------
 async function apiJson(action, body=null, qs='') {
@@ -189,6 +230,18 @@ async function apiJson(action, body=null, qs='') {
     throw e2;
   }
   return j;
+}
+
+// ---------------- Refresh Root Size ----------------
+async function refreshRootSize() {
+  const el = document.getElementById('rootSize');
+  if (!el) return;
+  try {
+    const j = await apiJson('rootStats');
+    el.textContent = '📦 Storage used: ' + j.formatted;
+  } catch (e) {
+    showToast('Root size refresh failed');
+  }
 }
 
 // --- My Password ---
@@ -234,24 +287,6 @@ function lbGo(delta) {
   openLightboxForItem(list[i]);
 }
 
-// ---------------- Download ----------------
-function triggerDownload(url) {
-  const a = document.createElement('a');
-  a.href = url;
-  a.style.display = 'none';
-  a.rel = 'noopener';
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(() => {
-    try { a.remove(); } catch {}
-  }, 1000);
-  setTimeout(() => {
-    hideSpinner();
-    elStatus.textContent = 'Ready.';
-  }, 400);
-}
-
-
 // ---------------- Tree ----------------
 function treeNodeEl(node, level=0) {
   const wrap = document.createElement('div');
@@ -275,13 +310,14 @@ function treeNodeEl(node, level=0) {
       chev.textContent = '▸';
       return;
     }
-  expandedTreeNodes.add(node.path);
-  chev.textContent = '▾';
-  const children = await apiJson('treeChildren', { path: node.path });
-  const indent = document.createElement('div');
-  indent.className = 'indent';
-  children.nodes.forEach(ch => indent.appendChild(treeNodeEl(ch, level + 1)));
-  wrap.appendChild(indent);
+    expandedTreeNodes.add(node.path);
+    chev.textContent = '▾';
+    const children = await apiJson('treeChildren', { path: node.path });
+    const indent = document.createElement('div');
+    indent.className = 'indent';
+    children.nodes.forEach(ch => indent.appendChild(treeNodeEl(ch, level + 1))
+    );
+    wrap.appendChild(indent);
 });
 
   const name = document.createElement('span');
@@ -322,8 +358,10 @@ function treeNodeEl(node, level=0) {
   const action = isCopy ? 'copy' : 'move';
   try {
     await apiJson(action, { paths, dest: node.path });
-    showToast(isCopy ? 'Copied.' : 'Moved.');
+    fixCwdAfterMove(paths, node.path);
+    rebuildTreeStateAfterMove(node.path);
     await refreshAll();
+    showToast(isCopy ? 'Copied.' : 'Moved.');
   } catch (err) {
     showToast((isCopy ? 'Copy' : 'Move') + ' failed: ' + (err?.message || err), 3500);
   }
@@ -354,34 +392,65 @@ return wrap;
 
 async function loadTree() {
   elTree.textContent = 'Loading…';
-  try{
+  try {
     const j = await apiJson('treeRoot');
     elTree.innerHTML = '';
-    const root = document.createElement('div');
-    root.className = 'node' + (cwd === '' ? ' active':'');
-    root.textContent = '🏠 Root';
-    root.dataset.path = '';
-    root.addEventListener('click', ()=>openDir(''));
-    root.addEventListener('dragover', (e)=>{e.preventDefault(); root.style.borderColor='rgba(90,167,255,.7)'; root.style.borderWidth='1px'; root.style.borderStyle='solid'; root.style.borderRadius='12px';});
-    root.addEventListener('dragleave', ()=>{root.style.border='';});
-    root.addEventListener('drop', async (e)=>{
-    e.preventDefault(); root.style.border='';
-    const src = e.dataTransfer.getData('text/x-explorer-path');
-    if (!src) return;
-    const paths = Array.from(selected.size ? selected : [src]);
-    const isCopy = e.metaKey || e.ctrlKey || e.altKey;
-    const action = isCopy ? 'copy' : 'move';
-    try {
-      await apiJson(action, { paths, dest: '' });
-      showToast(isCopy ? 'Copied.' : 'Moved.');
-      await refreshAll();
-    } catch (err) {
-      showToast((isCopy ? 'Copy' : 'Move') + ' failed: ' + (err?.message || err), 3500);
+    if (window.IS_ADMIN) {
+      const root = document.createElement('div');
+      root.className = 'node' + (cwd === '' ? ' active' : '');
+      root.dataset.path = '';
+      const chev = document.createElement('span');
+      chev.className = 'chev';
+      chev.textContent = ' ';
+      const name = document.createElement('span');
+      name.className = 'folder';
+      name.textContent = '🏠 Root';
+      root.appendChild(chev);
+      root.appendChild(name);
+      root.addEventListener('click', () => openDir(''));
+      root.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        root.style.borderColor = 'rgba(90,167,255,.7)';
+        root.style.borderWidth = '1px';
+        root.style.borderStyle = 'solid';
+        root.style.borderRadius = '12px';
+      });
+      root.addEventListener('dragleave', () => {
+        root.style.border = '';
+      });
+      root.addEventListener('drop', async (e) => {
+        e.preventDefault();
+        root.style.border = '';
+        const src = e.dataTransfer.getData('text/x-explorer-path');
+        if (!src) return;
+        const paths = Array.from(selected.size ? selected : [src]);
+        const isCopy = e.metaKey || e.ctrlKey || e.altKey;
+        const action = isCopy ? 'copy' : 'move';
+        try {
+          await apiJson(action, { paths, dest: '' });
+          fixCwdAfterMove(paths, '');
+          rebuildTreeStateAfterMove('');
+          await refreshAll();
+          showToast(isCopy ? 'Copied.' : 'Moved.');
+        } catch (err) {
+          showToast(
+            (isCopy ? 'Copy' : 'Move') + ' failed: ' + (err?.message || err),
+            3500
+          );
+        }
+      });
+      elTree.appendChild(root);
     }
-  });
-    elTree.appendChild(root);
+    if (!j.nodes || !j.nodes.length) {
+      const msg = document.createElement('div');
+      msg.style.marginTop = '15px';
+      msg.style.marginLeft = '37px';
+      msg.textContent = 'No folders available.';
+      elTree.appendChild(msg);
+      return;
+    }
     j.nodes.forEach(n => elTree.appendChild(treeNodeEl(n)));
-  } catch(err) {
+  } catch (err) {
     elTree.textContent = 'Tree error: ' + err.message;
   }
 }
@@ -397,17 +466,40 @@ function renderCrumbs() {
     c.addEventListener('click', ()=>openDir(path));
     return c;
   };
-  elCrumbs.appendChild(make('Root', ''));
+  if (window.IS_ADMIN) {
+    elCrumbs.appendChild(make('Root', ''));
+  }
   let acc = '';
   for (const p of parts) {
     acc = acc ? acc + '/' + p : p;
     elCrumbs.appendChild(make(p, acc));
   }
-  elPathInfo.textContent = cwd ? '/' + cwd : '/';
+  elPathInfo.textContent = cwd ? '/' + cwd : (window.IS_ADMIN ? '/' : '');
 }
 
 function setSelectedTag() {
   elSelTag.textContent = `${selected.size} selected`;
+}
+
+function updateHeaderButtons(){
+  const has = selected.size > 0;
+  const single = selected.size === 1;
+  const it = single ? items.find(x => x.path === [...selected][0]) : null;
+  const isZip = it && it.type === 'file' && /\.zip$/i.test(it.name);
+  const map = {
+    btnDelete: has,
+    btnZip: has,
+    btnDownload: has,
+    btnCopy: has,
+    btnMove: has,
+    btnRename: single,
+    btnShare: single,
+    btnUnzip: isZip
+  };
+  for (const id in map) {
+    const b = document.getElementById(id);
+    if (b) b.disabled = !map[id];
+  }
 }
 
 function renderList() {
@@ -420,7 +512,7 @@ function renderList() {
     tr.dataset.path = it.path;
     if (selected.has(it.path)) tr.classList.add('sel');
     tr.innerHTML = `
-      <td>${it.type === 'dir' ? '📁 ' : '📄 '}${escapeHtml(it.name)}</td>
+      <td>${it.type === 'dir' ? '📁 ' : '📄 '}${escapeHtml(it.name)}</td>
       <td>${it.type}</td>
       <td>${it.type === 'dir' ? '—' : fmtSize(it.size)}</td>
       <td>${fmtTime(it.mtime)}</td>
@@ -455,6 +547,7 @@ function renderList() {
     renderList();
     updateSortIcons();
     setSelectedTag();
+    updateHeaderButtons();
     if (selected.size === 1) openPreview(it);
     else clearPreview();
   });
@@ -495,8 +588,10 @@ if (it.type === 'dir') {
       const isCopy = e.metaKey || e.ctrlKey || e.altKey;
       const action = isCopy ? 'copy' : 'move';
       await apiJson(action, { paths, dest: it.path });
-      showToast(isCopy ? 'Copied.' : 'Moved.');
+      rebuildTreeStateAfterMove(it.path);
+      await new Promise(r => setTimeout(r, 100));
       await refreshAll();
+      showToast(isCopy ? 'Copied.' : 'Moved.');
     } catch (err) {
       showToast('Move failed: ' + (err?.message || err), 4000);
     }
@@ -526,7 +621,6 @@ if (it.type === 'dir') {
     tr.classList.remove('dropTarget');
   });
 }
-
   elListBody.appendChild(tr);
   }
 }
@@ -564,8 +658,11 @@ elListTable.addEventListener('drop', async (e) => {
     const isCopy = e.metaKey || e.ctrlKey || e.altKey;
     const action = isCopy ? 'copy' : 'move';
     await apiJson(action, { paths, dest });
-    showToast(isCopy ? 'Copied.' : (dest === cwd ? 'Moved.' : 'Moved to folder.'));
+    fixCwdAfterMove(paths, dest);
+    rebuildTreeStateAfterMove(dest);
+    await new Promise(r => setTimeout(r, 100));
     await refreshAll();
+    showToast(isCopy ? 'Copied.' : (dest === cwd ? 'Moved.' : 'Moved to folder.'));
   } catch (err) {
     showToast((isCopy ? 'Copy' : 'Move') + ' failed: ' + (err?.message || err), 4000);
   }
@@ -579,6 +676,7 @@ async function openDir(path) {
   cwd = path || '';
   selected.clear();
   setSelectedTag();
+  updateHeaderButtons();
   clearPreview();
   renderCrumbs();
   elStatus.textContent = 'Loading…';
@@ -594,9 +692,33 @@ async function openDir(path) {
   }
 }
 
+function expandToCwd() {
+  let p = cwd;
+  while (p) {
+    expandedTreeNodes.add(p);
+    p = parentDir(p);
+  }
+}
+
 async function refreshAll() {
+  expandedTreeNodes.clear();
+  expandToCwd();
   await openDir(cwd);
-  await loadTree();
+  if (rootSize) {
+    setTimeout(refreshRootSize, 100);
+  }
+}
+
+function rebuildTreeStateAfterMove(dest) {
+  expandedTreeNodes.clear();
+  expandedTreeNodes.add('');
+  if (dest) {
+    let p = dest;
+    while (p) {
+      expandedTreeNodes.add(p);
+      p = parentDir(p);
+    }
+  }
 }
 
 // ---------------- Preview / Editor ----------------
@@ -620,23 +742,31 @@ function clearPreview() {
 }
 
 function isTextExt(name){
-  return /\.(txt|md|json|xml|yml|yaml|ini|log|csv|tsv|php|js|ts|css|html|htm|py|go|java|c|cpp|h|hpp|sh|zsh|env|sql|xmp)$/i.test(name);
+  return /\.(txt|md|json|xml|yml|yaml|ini|log|csv|tsv|php|js|ts|css|html?|py|go|java|c|cpp|h|hpp|sh|zsh|env|sql|xmp)$/i.test(name);
 }
 
-function isImageExt(name){ return /\.(png|jpg|jpeg|gif|webp|svg|dng|heic|tiff)$/i.test(name); }
+function isImageExt(name){ return /\.(png|jpe?g|gif|webp|svg|dng|heic|tiff)$/i.test(name); }
 function isAudioExt(name){ return /\.(mp3|wav|ogg|m4a|aac)$/i.test(name); }
 function isVideoExt(name){ return /\.(mp4|webm|mov|m4v)$/i.test(name); }
 function isPdf(name){ return /\.pdf$/i.test(name); }
 
+function setEditorReadonly(on){
+  editor.readOnly = !!on;
+  editor.classList.toggle('readonly', !!on);
+}
+
 async function openPreview(it) {
   currentPreview = it;
+  setEditorVisible(false);
+  editor.value = '';
+  setEditorReadonly(true);
   pvTitle.textContent = it.name;
   pvMeta.textContent = `${it.type} • ${it.type==='file'?fmtSize(it.size):'—'} • ${fmtTime(it.mtime)}`;
-  setEditorVisible(false);
   if (it.type === 'dir') {
     pvKind.textContent = 'Folder';
     pvBody.innerHTML = `<div class="small muted">Folder selected. You can download it as a ZIP.</div>`;
     editor.value = '';
+    setEditorVisible(false);
     return;
   }
   const p = encodeURIComponent(it.path);
@@ -671,12 +801,14 @@ async function openPreview(it) {
     pvKind.textContent = 'Text';
     pvBody.innerHTML = `<div class="small muted">Text file – loaded in the editor.</div>`;
     setEditorVisible(true);
-    try{
-      const j = await apiJson('readText', {path: it.path});
+    setEditorReadonly(!!window.IS_SHARE_VIEW);
+    try {
+      const j = await apiJson('readText', { path: it.path });
       editor.value = j.text || '';
-    } catch(err){
+    } catch (err) {
       editor.value = '';
-      pvBody.innerHTML = `<div class="small muted">Cannot read: ${escapeHtml(err.message)}</div>`;
+      pvBody.innerHTML =
+        `<div class="small muted">Cannot read: ${escapeHtml(err.message)}</div>`;
       setEditorVisible(false);
     }
     return;
@@ -761,6 +893,7 @@ document.addEventListener('keydown', (e) => {
   }
   renderList();
   setSelectedTag();
+  updateHeaderButtons();
   if (selected.size !== 1) {
     clearPreview();
   }
@@ -773,6 +906,10 @@ lbOpenBtn.addEventListener('click', ()=>{
 });
 
 async function openLightboxForItem(it){
+  if (window.IS_SHARE_VIEW) {
+    lbSave.style.display = 'none';
+    lbEditorWrap.style.display = 'none';
+  }
   if (!it) return;
   lbItem = it;
   lbBody.classList.remove('pdf');
@@ -802,7 +939,8 @@ async function openLightboxForItem(it){
     if (lbKind) lbKind.textContent = 'Text';
     lbBody.style.display = 'none';
     lbEditorWrap.style.display = 'flex';
-    lbSave.style.display = 'inline-flex';
+    lbSave.style.display = window.IS_SHARE_VIEW ? 'none' : 'inline-flex';
+    setEditorReadonly(!!window.IS_SHARE_VIEW);
     try {
       const j = await apiJson('readText', { path: it.path });
       lbEditor.value = j.text || '';
@@ -831,18 +969,16 @@ async function openLightboxForItem(it){
     lbShow();
     return;
   }
-  if (isPdf(name)) {
-    if (lbKind) lbKind.textContent = 'PDF';
-    lbBody.innerHTML = `<iframe src="${url}" style="width:100%; height:100%; border:0; border-radius:14px; background:#fff"></iframe>`;
-    lbShow();
-    return;
-  }
   if (lbKind) lbKind.textContent = 'File';
   lbBody.innerHTML = `<div class="small muted">No preview available. Use download.</div>`;
   lbShow();
 }
 
 lbSave.addEventListener('click', async ()=>{
+  if (window.IS_SHARE_VIEW) {
+    showToast('Read-only preview.');
+    return;
+  }
   if (!lbItem || lbItem.type !== 'file') return;
   if (!isTextExt(lbItem.name)) return;
   try{
@@ -863,17 +999,58 @@ const fpTree = document.getElementById('fpTree');
 const fpTitle = document.getElementById('fpTitle');
 const fpSelected = document.getElementById('fpSelected');
 const fpOk = document.getElementById('fpOk');
+fpOk.addEventListener('click', () => {
+  if (!fpResolve) return;
+  const r = fpResolve;
+  const dest = fpDest;
+  fpResolve = null;
+  fpHide();
+  r(dest);
+});
+
 const fpClose = document.getElementById('fpClose');
+fpClose.addEventListener('click', () => {
+  if (!fpResolve) return;
+  const r = fpResolve;
+  fpResolve = null;
+  fpHide();
+  r(null);
+});
+
 const fpCancel = document.getElementById('fpCancel');
+fpCancel.addEventListener('click', () => {
+  if (!fpResolve) return;
+  const r = fpResolve;
+  fpResolve = null;
+  fpHide();
+  r(null);
+});
+
+fp.addEventListener('click', (e)=>{
+  if (e.target === fp) {
+    if (!fpResolve) return;
+    const r = fpResolve;
+    fpResolve = null;
+    fpHide();
+    r(null);
+  }
+});
 
 let fpDest = '';
 let fpResolve = null;
 
-function fpShow(){ fp.style.display = 'grid'; }
-function fpHide(){
+function fpShow(){
+  fp.style.display = 'grid';
+}
+
+function fpHide(resetDest = true){
   fp.style.display = 'none';
   fpTree.innerHTML = '';
   fpResolve = null;
+  if (resetDest) {
+    fpDest = '';
+    fpSelected.textContent = 'Destination: /';
+  }
 }
 
 function fpSetDest(rel){
@@ -932,34 +1109,36 @@ async function openFolderPicker({ title='Select destination folder', initial='' 
   fpTitle.textContent = title;
   fpTree.innerHTML = 'Loading folders…';
   fpSetDest(initial || '');
-  const rootRow = document.createElement('div');
-  rootRow.className = 'fp-node';
-  rootRow.dataset.path = '';
-  rootRow.innerHTML = `<span class="fp-chev"> </span><div style="font-weight:650">🏠 Root</div>`;
-  rootRow.addEventListener('click', ()=> fpSetDest(''));
-  try{
+  let rootRow = null;
+  if (window.IS_ADMIN) {
+    rootRow = document.createElement('div');
+    rootRow.className = 'fp-node';
+    rootRow.dataset.path = '';
+    rootRow.innerHTML =
+      `<span class="fp-chev"> </span><div style="font-weight:650">🏠 Root</div>`;
+    rootRow.addEventListener('click', ()=> fpSetDest(''));
+  }
+  try {
     const j = await apiJson('treeRoot');
     fpTree.innerHTML = '';
-    fpTree.appendChild(rootRow);
-    (j.nodes || []).forEach(n => fpTree.appendChild(fpNodeEl(n)));
-    fpSetDest(initial || '');
+    if (rootRow) {
+      fpTree.appendChild(rootRow);
+    }
+    (j.nodes || []).forEach(n =>
+      fpTree.appendChild(fpNodeEl(n))
+    );
+    if (!window.IS_ADMIN && !initial && j.nodes?.[0]) {
+      fpSetDest(j.nodes[0].path);
+    } else {
+      fpSetDest(initial || '');
+    }
   } catch(err){
-    fpTree.innerHTML = `<div class="small muted">Error: ${escapeHtml(err.message)}</div>`;
+    fpTree.innerHTML =
+      `<div class="small muted">Error: ${escapeHtml(err.message)}</div>`;
   }
   fpShow();
-  return new Promise((resolve)=>{
-    fpResolve = resolve;
-  });
+  return new Promise(resolve => { fpResolve = resolve; });
 }
-fpClose.addEventListener('click', ()=>{ if(fpResolve) fpResolve(null); fpHide(); });
-fpCancel.addEventListener('click', ()=>{ if(fpResolve) fpResolve(null); fpHide(); });
-fp.addEventListener('click', (e)=>{
-  if (e.target === fp) { if(fpResolve) fpResolve(null); fpHide(); }
-});
-fpOk.addEventListener('click', ()=>{
-  if (fpResolve) fpResolve(fpDest);
-  fpHide();
-});
 
 // ---------------- RENAME/OVERRIDE ----------------
 function chooseOverwriteRename({ title, message }) {
@@ -1021,7 +1200,7 @@ function waitIfJobPaused(job){
 
 const uploadsEl = document.getElementById('uploads');
 const jobs = new Map();
-const MAX_PARALLEL = 100;
+const MAX_PARALLEL = 4;
 let running = 0;
 
 function makeJobId(){
@@ -1301,6 +1480,8 @@ function schedule(){
     })
     .finally(async ()=>{
       running--;
+      rebuildTreeStateAfterMove(cwd);
+      await new Promise(r => setTimeout(r, 100));
       await refreshAll();
       schedule();
     });
@@ -1321,7 +1502,7 @@ function enqueueFiles(fileList, relativeFromInput=false){
       kind: relDir ? 'Folder' : 'File',
       file: f,
       relativePath: relDir,
-      displayName: relDir ? `${relDir}/${f.name}` : f.name,
+      displayName: cwd ? (relDir ? `${cwd}/${relDir}/${f.name}` : `${cwd}/${f.name}`) : (relDir ? `${relDir}/${f.name}` : f.name),
       uploadId: null,
       state: 'queued',
       paused: false,
@@ -1355,10 +1536,8 @@ function renderGlobalUploadButtons(){
 }
 
 // Drag & drop files/folders
-async function traverseEntry(entry, parentDir = '') {
+async function traverseEntry(entry, parentDir = '', dirs = new Set()) {
   return new Promise((resolve) => {
-
-    // ---------- FILE ----------
     if (entry.isFile) {
       entry.file(file => {
         file._relativeDir = parentDir;
@@ -1366,19 +1545,16 @@ async function traverseEntry(entry, parentDir = '') {
       }, () => resolve([]));
       return;
     }
-
-    // ---------- DIRECTORY ----------
     if (entry.isDirectory) {
+      const dirPath = parentDir ? `${parentDir}/${entry.name}` : entry.name;
+      dirs.add(dirPath);
       const reader = entry.createReader();
       const files = [];
-      const dirPath = parentDir
-        ? `${parentDir}/${entry.name}`
-        : entry.name;
       const read = () => {
         reader.readEntries(async entries => {
           if (!entries.length) return resolve(files);
           for (const e of entries) {
-            const childFiles = await traverseEntry(e, dirPath);
+            const childFiles = await traverseEntry(e, dirPath, dirs);
             files.push(...childFiles);
           }
           read();
@@ -1392,27 +1568,38 @@ async function traverseEntry(entry, parentDir = '') {
 }
 
 elDrop.addEventListener('dragover', (e)=>{ e.preventDefault(); elDrop.classList.add('drag'); });
-elDrop.addEventListener('dragleave', ()=> elDrop.classList.remove('drag'));
+elDrop.addEventListener('dragleave', (e)=>{
+  if (e.relatedTarget && elDrop.contains(e.relatedTarget)) return;
+  elDrop.classList.remove('drag');
+});
 elDrop.addEventListener('drop', async (e) => {
   e.preventDefault();
   elDrop.classList.remove('drag');
   const dt = e.dataTransfer;
   if (!dt) return;
-  const items = Array.from(dt.items || []);
+  const dtItems = Array.from(dt.items || []);
   const hasFiles = dt.files && dt.files.length;
-  if (supportsDirectoryDnD() && items.length) {
-    const entries = items
+  if (supportsDirectoryDnD() && dtItems.length) {
+    const entries = dtItems
       .map(it => it.webkitGetAsEntry?.())
       .filter(Boolean);
   if (!entries.length) return;
-  const results = await Promise.all(
-    entries.map(e => traverseEntry(e, ''))
-  );
-  const files = results.flat();
-  if (files.length) {
-    enqueueFiles(files, false);
-    return;
-  }
+const dirs = new Set();
+const results = await Promise.all(
+  entries.map(e => traverseEntry(e, '', dirs))
+);
+const files = results.flat();
+for (const dir of Array.from(dirs).sort((a, b) => a.length - b.length)) {
+  const fullDir = cwd ? (dir ? `${cwd}/${dir}` : cwd) : dir;
+  await apiJson('mkdir', {
+    parent: fullDir.includes('/') ? fullDir.slice(0, fullDir.lastIndexOf('/')) : '',
+    name: fullDir.split('/').pop()
+  });
+}
+if (files.length) {
+  enqueueFiles(files, false);
+}
+return;
 }
   if (!supportsDirectoryDnD()) {
     showToast('Safari: Please select a folder…');
@@ -1484,67 +1671,154 @@ fileInput.addEventListener('change', ()=> {
 dirInput.addEventListener('change', () => {
   const files = Array.from(dirInput.files || []);
   if (!files.length) return;
-  const root = detectRootFolder(files);
-  const mapped = files.map(f => {
-    const rp = f.webkitRelativePath || f.name;
+  for (const f of files) {
+    const rp = f.webkitRelativePath || '';
     const parts = rp.split('/');
-    const rootFolder = parts.shift();
-    const subPath = parts.slice(0,-1).join('/');
-    return {
-      file: f,
-      relDir: rootFolder + (subPath ? '/' + subPath : ''),
-      name: f.name
-    };
-  });
-  enqueueFiles(mapped, true);
+    parts.pop(); // Dateiname weg
+    f._relativeDir = parts.join('/');
+  }
+  enqueueFiles(files, false);
   dirInput.value = '';
 });
 
 document.getElementById('btnNewFolder').addEventListener('click', async ()=>{
   const name = prompt('Folder name:', 'New Folder');
   if (!name) return;
-  try{ await apiJson('mkdir', {parent: cwd, name}); await refreshAll(); }
+  try{ await apiJson('mkdir', {parent: cwd, name});
+    rebuildTreeStateAfterMove(cwd || '');
+    await new Promise(r => setTimeout(r, 100));
+    await refreshAll();
+    selected.clear();
+    setSelectedTag();
+    updateHeaderButtons();
+    showToast('ZIP extracted.');
+      }
   catch(err){ showToast('Mkdir: ' + err.message, 3500); }
+});
+
+document.getElementById('btnRename')?.addEventListener('click', async ()=>{
+  if (selected.size !== 1) return showToast('Select exactly one item.');
+  const p = Array.from(selected)[0];
+  const it = items.find(x => x.path === p);
+  if (!it) return;
+  const nn = prompt('Rename:', it.name);
+  if (!nn) return;
+  try {
+    await apiJson('rename', { path: it.path, newName: nn });
+    await refreshAll();
+    showToast('Renamed.');
+  } catch (err) {
+    showToast('Rename: ' + err.message, 4000);
+  }
+});
+
+document.getElementById('btnCopy')?.addEventListener('click', async ()=>{
+  if (!selected.size) return showToast('Nothing selected.');
+  const dest = await openFolderPicker({ title:'📄 Copy to…', initial: cwd || '' });
+  if (dest === null) return;
+  await apiJson('copy', { paths: Array.from(selected), dest });
+  await refreshAll();
+  showToast('Copied.');
+});
+
+document.getElementById('btnMove')?.addEventListener('click', async ()=>{
+  if (!selected.size) return showToast('Nothing selected.');
+  const dest = await openFolderPicker({ title:'📦 Move to…', initial: cwd || '' });
+  if (dest === null) return;
+  await apiJson('move', { paths: Array.from(selected), dest });
+  await refreshAll();
+  showToast('Moved.');
 });
 
 document.getElementById('btnDelete').addEventListener('click', async ()=>{
   if (!selected.size) return showToast('Nothing selected.');
   if (!confirm(`Really delete? (${selected.size})`)) return;
-  try{ await apiJson('delete', {paths: Array.from(selected)}); selected.clear(); setSelectedTag(); await refreshAll(); }
+  try{ await apiJson('delete', {paths: Array.from(selected)});
+    selected.clear();
+    setSelectedTag();
+    updateHeaderButtons();
+    rebuildTreeStateAfterMove(parentDir(cwd));
+    await new Promise(r => setTimeout(r, 100));
+    await refreshAll();
+  }
   catch(err){ showToast('Delete: ' + err.message, 3500); }
 });
 
-document.getElementById('btnZip').addEventListener('click', async ()=>{
+document.getElementById('btnZip').addEventListener('click', async () => {
   if (!selected.size) return showToast('Nothing selected.');
-  let name;
-  if (selected.size === 1) {
-    const p = Array.from(selected)[0];
-    const it = items.find(x => x.path === p);
-    name = it ? it.name : 'archive';
-  } else {
-    name = cwd ? cwd.split('/').pop() : 'selection';
-  }
-  if (!name.toLowerCase().endsWith('.zip')) {
-    name += '.zip';
-  }
-  try{
-    elStatus.textContent = 'Creating ZIP…';
+  try {
     showSpinner();
+    elStatus.textContent = 'Creating ZIP…';
     const j = await apiJson('zipCreate', {
-      paths: Array.from(selected),
-      name,
-      destDir: cwd,
-      policy: 'rename'
+      cwd,
+      paths: Array.from(selected)
     });
     hideSpinner();
-    showToast('ZIP created: ' + j.path, 3500);
-    await refreshAll();
     elStatus.textContent = 'Ready.';
-  } catch(err){
+    await refreshAll();
+    selected.clear();
+    setSelectedTag();
+    updateHeaderButtons();
+    showToast('ZIP created.');
+  } catch (err) {
     hideSpinner();
-    showToast('ZIP: ' + err.message, 4500);
+    elStatus.textContent = 'Ready.';
+    showToast('ZIP: ' + err.message, 4000);
+  }
+});
+
+document.getElementById('btnUnzip').addEventListener('click', async () => {
+  if (selected.size !== 1) {
+    return showToast('Please select exactly one ZIP file.');
+  }
+  const [p] = Array.from(selected);
+  const it = items.find(x => x.path === p);
+  if (!it || it.type !== 'file' || !/\.zip$/i.test(it.name)) {
+    return showToast('Selected item is not a ZIP file.');
+  }
+  showSpinner();
+  elStatus.textContent = 'Extracting ZIP…';
+  try {
+    await apiJson('unzip', {
+      path: it.path,
+      dest: cwd || '',
+      policy: 'ask'
+    });
+  } catch (err) {
+    if (err.status === 409 && err.data?.needsChoice) {
+      const policy = await chooseOverwriteRename({
+        title: 'File already exists',
+        message: `Already exists during extraction:\n\n${err.data.path}`
+      });
+      if (!policy) {
+        showToast('Extraction canceled.');
+        return;
+      }
+      try {
+        await apiJson('unzip', {
+          path: it.path,
+          dest: cwd || '',
+          policy
+        });
+      } catch (e2) {
+        showToast('Unzip failed: ' + (e2?.message || e2), 4000);
+        return;
+      }
+    } else {
+      showToast('Unzip failed: ' + (err?.message || err), 4000);
+      return;
+    }
+  } finally {
+    hideSpinner();
     elStatus.textContent = 'Ready.';
   }
+  rebuildTreeStateAfterMove(cwd || '');
+  await new Promise(r => setTimeout(r, 100));
+  await refreshAll();
+  selected.clear();
+  setSelectedTag();
+  updateHeaderButtons();
+  showToast('ZIP extracted.');
 });
 
 document.getElementById('btnShare').addEventListener('click', async ()=>{
@@ -1623,7 +1897,7 @@ document.getElementById('btnShares').addEventListener('click', async ()=>{
           ${s.type === 'dir' ? '📁' : '📄'} ${s.path || '/'}
           ${s.exists ? '' : '<span class="tag danger">MISSING</span>'}
         </div>
-        <div class="small">
+        <div class="small" style="margin-top: 10px;">
           <a href="${s.url}" target="_blank">${s.url}</a>
         </div>
       `;
@@ -1667,19 +1941,169 @@ const userListBox = document.getElementById('userListBox');
 const btnUsers = document.getElementById('btnUsers');
 const btnCloseUsers = document.getElementById('btnCloseUsers');
 const btnUsersRefresh = document.getElementById('btnUsersRefresh');
+// --- ACL cleanup state ---
+let userPanelDirty = false;
 const uNewUser = document.getElementById('uNewUser');
 const uNewPass = document.getElementById('uNewPass');
 const uNewPass2 = document.getElementById('uNewPass2');
 const btnUserAdd = document.getElementById('btnUserAdd');
+const aclExpandedNodes = new Set();
+const userFolderOpen = new Map();
 
-function usersOpen(){ userPanel.style.display = 'grid'; }
-function usersClose(){
+function usersOpen(){
+  userPanelDirty = false;
+  userPanel.style.display = 'grid';
+}
+
+async function usersClose(){
   userPanel.style.display = 'none';
   userListBox.innerHTML = '';
+  if (window.IS_ADMIN && userPanelDirty) {
+    userPanelDirty = false;
+    try {
+      const j = await apiJson('aclCleanup');
+      if (j.usersAffected > 0) {
+        showToast(`ACL cleanup: ${j.usersAffected} user(s) updated`, 3500);
+      }
+    } catch (e) {
+      console.warn('ACL cleanup failed', e);
+    }
+  }
 }
 
 btnCloseUsers?.addEventListener('click', usersClose);
 userPanel?.addEventListener('click', (e)=>{ if (e.target === userPanel) usersClose(); });
+
+async function renderAclNode(container, user, node, acl, level = 0) {
+  if (acl[node.path]) {
+    let p = node.path;
+    aclExpandedNodes.add(p);
+    while (p.includes('/')) {
+      p = p.substring(0, p.lastIndexOf('/'));
+      aclExpandedNodes.add(p);
+    }
+  }
+  const wrap = document.createElement('div');
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.style.alignItems = 'center';
+  row.style.gap = '6px';
+  row.style.marginLeft = (level * 16) + 'px';
+  row.style.marginTop = '10px';
+  row.style.fontSize = '14px';
+
+  // Toggle
+  const toggle = document.createElement('span');
+  toggle.textContent = node.hasChildren ? (aclExpandedNodes.has(node.path) ? '▾' : '▸') : ' ';
+  toggle.style.cursor = 'pointer';
+  toggle.style.width = '16px';
+
+  // Checkbox
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.checked = !!acl[node.path];
+
+  // Label
+  const label = document.createElement('span');
+  label.textContent = node.name;
+  label.style.flex = '1';
+
+  // Read / Write
+  const sel = document.createElement('select');
+  sel.innerHTML = `
+    <option value="read">⇅ Read</option>
+    <option value="write">⇅ Write</option>
+  `;
+  sel.value = acl[node.path] || 'read';
+  sel.disabled = !cb.checked;
+
+  // ----- ACL logic -----
+  cb.addEventListener('change', async () => {
+    userPanelDirty = true;
+    if (cb.checked) {
+      sel.disabled = false;
+      await apiJson('userFolderSet', {
+        user: user.user,
+        path: node.path,
+        mode: sel.value
+      });
+    } else {
+      sel.disabled = true;
+      await apiJson('userFolderRemove', {
+        user: user.user,
+        path: node.path
+      });
+    }
+  });
+
+  sel.addEventListener('change', async () => {
+    userPanelDirty = true;
+    await apiJson('userFolderSet', {
+      user: user.user,
+      path: node.path,
+      mode: sel.value
+    });
+  });
+
+// ----- Expand / Collapse -----
+toggle.addEventListener('click', async () => {
+  if (!node.hasChildren) return;
+  const isOpen = aclExpandedNodes.has(node.path);
+  if (isOpen) {
+    aclExpandedNodes.delete(node.path);
+    wrap.querySelector('.acl-children')?.remove();
+    toggle.textContent = '▸';
+    return;
+  }
+  aclExpandedNodes.add(node.path);
+  toggle.textContent = '▾';
+  if (!wrap.querySelector('.acl-children')) {
+    const j = await apiJson('treeChildren', { path: node.path });
+    const children = document.createElement('div');
+    children.className = 'acl-children';
+    for (const ch of j.nodes || []) {
+      await renderAclNode(children, user, ch, acl, level + 1);
+    }
+    wrap.appendChild(children);
+  }
+});
+  row.append(toggle, cb, label, sel);
+  wrap.appendChild(row);
+  container.appendChild(wrap);
+
+// Restore open state
+  if (node.hasChildren && aclExpandedNodes.has(node.path)) {
+    toggle.textContent = '▾';
+    if (!wrap.querySelector('.acl-children')) {
+      const j = await apiJson('treeChildren', { path: node.path });
+      const children = document.createElement('div');
+      children.className = 'acl-children';
+      for (const ch of j.nodes || []) {
+        await renderAclNode(children, user, ch, acl, level + 1);
+      }
+      wrap.appendChild(children);
+    }
+  }
+}
+
+async function renderUserFolders(container, user) {
+  container.innerHTML = '<div class="small muted">Loading folders…</div>';
+  const acl = user.folders || {};
+  aclExpandedNodes.clear();
+  for (const path of Object.keys(acl)) {
+    let p = path;
+    aclExpandedNodes.add(p);
+    while (p.includes('/')) {
+      p = p.substring(0, p.lastIndexOf('/'));
+      aclExpandedNodes.add(p);
+    }
+  }
+  const root = await apiJson('treeRoot');
+  container.innerHTML = '';
+  for (const n of root.nodes || []) {
+    await renderAclNode(container, user, n, acl);
+  }
+}
 
 async function renderUsers(){
   userListBox.innerHTML = 'Loading…';
@@ -1687,10 +2111,12 @@ async function renderUsers(){
   const users = j.users || [];
   const me = j.me || '';
   userListBox.innerHTML = '';
+
   if (!users.length) {
     userListBox.innerHTML = '<div class="small muted">No users available.</div>';
     return;
   }
+
   for (const u of users) {
     const row = document.createElement('div');
     row.className = 'row';
@@ -1699,51 +2125,78 @@ async function renderUsers(){
     row.style.border = '1px solid rgba(34,48,71,.7)';
     row.style.borderRadius = '12px';
     row.style.padding = '10px';
+
     const left = document.createElement('div');
     left.innerHTML = `
       <div style="font-weight:650">
         👤 ${escapeHtml(u.user)}
         ${u.user === me ? '<span class="tag">You</span>' : ''}
       </div>
-      <div class="small muted">Created: ${u.created ? fmtTime(u.created) : '—'}</div>
+      <div class="small muted" style="margin-top: 10px;">Created: ${u.created ? fmtTime(u.created) : '—'}</div>
     `;
+
+    // --- Folder toggle (non-admin only)
+    if (u.role !== 'admin') {
+      const btnToggleFolders = document.createElement('button');
+      btnToggleFolders.className = 'btn small';
+      btnToggleFolders.textContent = '📁 Show folder permissions';
+      btnToggleFolders.style.marginTop = '10px';
+      const foldersBox = document.createElement('div');
+      foldersBox.style.padding = '10px';
+      foldersBox.style.display = 'none';
+      foldersBox.innerHTML = '<div class="small muted">Folders</div>';
+      btnToggleFolders.onclick = async () => {
+        const isOpen = userFolderOpen.get(u.user) === true;
+        if (isOpen) {
+          foldersBox.style.display = 'none';
+          btnToggleFolders.textContent = '📁 Show folder permissions';
+          userFolderOpen.set(u.user, false);
+          return;
+        }
+        foldersBox.style.display = 'block';
+        btnToggleFolders.textContent = '📂 Hide folder permissions';
+        if (!foldersBox.dataset.loaded) {
+          foldersBox.innerHTML = '<div class="small muted">Loading…</div>';
+          await renderUserFolders(foldersBox, u);
+          foldersBox.dataset.loaded = '1';
+        }
+        userFolderOpen.set(u.user, true);
+      };
+      left.appendChild(btnToggleFolders);
+      left.appendChild(foldersBox);
+    }
     const actions = document.createElement('div');
     actions.className = 'row';
     const btnPw = document.createElement('button');
     btnPw.className = 'btn';
     btnPw.textContent = '🔑 Password';
-    btnPw.onclick = async ()=>{
+    btnPw.onclick = async () => {
       const p1 = prompt(`New password for "${u.user}" (minimum 8 characters):`, '');
-      if (p1 === null) return;
-      if (String(p1).length < 8) return showToast('Password too short.', 3000);
+      if (!p1 || p1.length < 8) return showToast('Password too short.', 3000);
       const p2 = prompt('Repeat Password:', '');
-      if (p2 === null) return;
       if (p1 !== p2) return showToast('Passwords do not match.', 3000);
-      try{
-        await apiJson('userPw', { user: u.user, pass: p1, pass2: p2 });
-        showToast('Password changed.');
-      } catch(err){
-        showToast('User: ' + err.message, 3500);
-      }
+      await apiJson('userPw', { user: u.user, pass: p1, pass2: p2 });
+      showToast('Password changed.');
     };
     const btnDel = document.createElement('button');
     btnDel.className = 'btn danger';
     btnDel.textContent = '🗑 Delete';
-    btnDel.onclick = async ()=>{
+    btnDel.onclick = async () => {
       if (!confirm(`Really delete user?\n\n${u.user}`)) return;
-      try{
+      try {
         await apiJson('userDelete', { user: u.user });
-        row.remove();
-        showToast('User deleted.');
         await renderUsers();
-      } catch(err){
-        showToast('User: ' + err.message, 3500);
+        showToast('User deleted.');
+      } catch (err) {
+        showToast(err.message || 'Delete failed.', 4000);
       }
     };
-    actions.appendChild(btnPw);
-    actions.appendChild(btnDel);
-    row.appendChild(left);
-    row.appendChild(actions);
+    if (u.role === 'admin') {
+      btnDel.disabled = true;
+      btnDel.title = 'Admin cannot be deleted';
+    }
+    actions.append(btnPw, btnDel);
+    row.append(left, actions);
     userListBox.appendChild(row);
   }
 }
@@ -1775,61 +2228,70 @@ btnUserAdd?.addEventListener('click', async ()=>{
 });
 
 // ---------------- Actions ----------------
-document.getElementById('btnDownload').addEventListener('click', async ()=>{
-  if (selected.size > 1) {
-    try {
-      showSpinner();
-      elStatus.textContent = 'Creating ZIP…';
-      const prep = await apiJson('downloadPrepare', {
-        paths: Array.from(selected)
-      });
-      elStatus.textContent = 'Download starting…';
-      triggerDownload(API('download', 'dl=' + encodeURIComponent(prep.token)));
-      return;
-    } catch (err) {
-      hideSpinner();
-      elStatus.textContent = 'Ready.';
-      showToast('Download: ' + (err?.message || err), 4000);
-      return;
-    }
-  }
-  const it =
-    currentPreview ||
-    (selected.size === 1
-      ? items.find(x => x.path === Array.from(selected)[0])
-      : null);
-  if (!it) return showToast('Nothing selected.');
-  showSpinner();
+document.getElementById('btnDownload').addEventListener('click', async () => {
+  if (!selected.size) return showToast('Nothing selected.');
   try {
-    if (it.type === 'dir') {
-      elStatus.textContent = 'Creating ZIP…';
-      const prep = await apiJson('downloadPrepare', { path: it.path });
-      elStatus.textContent = 'Download starting…';
-      triggerDownload(API('download', 'dl=' + encodeURIComponent(prep.token)));
+    const paths = Array.from(selected);
+    const it = paths.length === 1
+      ? items.find(x => x.path === paths[0])
+      : null;
+    if (it && it.type === 'file') {
+      showSpinner();
+      startDownload(
+        API('preview', 'path=' + encodeURIComponent(it.path) + '&inline=0')
+      );
       return;
     }
-    elStatus.textContent = 'Download starting…';
-    triggerDownload(API('download', 'path=' + encodeURIComponent(it.path)));
+    await createZipAndDownload(paths);
   } catch (err) {
     hideSpinner();
     elStatus.textContent = 'Ready.';
-    showToast('Download: ' + err.message, 4000);
+    showToast('Download: ' + (err?.message || err), 4000);
   }
 });
 
+async function createZipAndDownload(paths) {
+  showSpinner();
+  elStatus.textContent = 'Creating ZIP…';
+  const j = await apiJson('download', {
+    cwd,
+    paths
+  });
+  startDownload(`?action=download&dl=${encodeURIComponent(j.token)}`);
+}
+
+function startDownload(url) {
+  elStatus.textContent = 'Download starting…';
+  const a = document.createElement('a');
+  a.href = url;
+  a.rel = 'noopener';
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    hideSpinner();
+    elStatus.textContent = 'Ready.';
+    a.remove();
+  }, 1200);
+}
+
 document.getElementById('btnSave').addEventListener('click', async ()=>{
+  if (window.IS_SHARE_VIEW) {
+    showToast('Read-only preview.');
+    return;
+  }
   if (!currentPreview || currentPreview.type !== 'file') return showToast('No file selected.');
   if (!isTextExt(currentPreview.name)) return showToast('Only text files can be saved.');
   try{
     await apiJson('saveText', {path: currentPreview.path, text: editor.value});
-    showToast('Saved.');
     await refreshAll();
+    showToast('Saved.');
   } catch(err){
     showToast('Save: ' + err.message, 3500);
   }
 });
 
-document.getElementById('btnRefreshTree').addEventListener('click', loadTree);
+document.getElementById('btnRefreshTree').addEventListener('click', reloadExplorerFull);
 elSearch.addEventListener('input', renderList);
 document.addEventListener('keydown', async (e)=>{
   if (e.key === 'F2' && selected.size === 1) {
@@ -1905,6 +2367,7 @@ function ensureContextSelection(item){
   lastClicked = item.path;
   renderList();
   setSelectedTag();
+  updateHeaderButtons();
 }
 
 document.addEventListener('click', (e)=>{
@@ -1976,9 +2439,15 @@ document.getElementById('list').addEventListener('pointermove', () => {
 ctx.addEventListener('click', async (e)=>{
   const btn = e.target.closest('button[data-act]');
   if (!btn) return;
+  const act = btn.dataset.act;
+  const fn = ACTIONS[act];
+  if (fn) {
+    hideCtx();
+    fn();
+    return;
+  }
   const item = ctxItem;
   if (!item) return;
-  const act = btn.dataset.act;
   try {
     if (act === 'open') {
       hideCtx();
@@ -1989,33 +2458,13 @@ ctx.addEventListener('click', async (e)=>{
 
     if (act === 'download') {
       hideCtx();
+      if (!selected.size) return;
       try {
-        showSpinner();
-        if (selected.size === 1) {
-          const [onlyPath] = Array.from(selected);
-          const it = items.find(x => x.path === onlyPath);
-          if (!it) throw new Error('Item not found');
-          if (it.type === 'dir') {
-            elStatus.textContent = 'Creating ZIP…';
-            const prep = await apiJson('downloadPrepare', { path: it.path });
-            elStatus.textContent = 'Download starting…';
-            triggerDownload(API('download', 'dl=' + encodeURIComponent(prep.token)));
-            return;
-          }
-          elStatus.textContent = 'Download starting…';
-          triggerDownload(API('download', 'path=' + encodeURIComponent(it.path)));
-          return;
-        }
-        elStatus.textContent = 'Creating ZIP…';
-        const prep = await apiJson('downloadPrepare', {
-          paths: Array.from(selected)
-        });
-        elStatus.textContent = 'Download starting…';
-        triggerDownload(API('download', 'dl=' + encodeURIComponent(prep.token)));
+        await createZipAndDownload(Array.from(selected));
       } catch (err) {
         hideSpinner();
         elStatus.textContent = 'Ready.';
-        showToast('Download: ' + (err?.message || err), 4000);
+        showToast('Download: ' + err.message, 4000);
       }
       return;
     }
@@ -2048,7 +2497,26 @@ ctx.addEventListener('click', async (e)=>{
       if (!selected.size) return showToast('Nothing selected.');
       const dest = await openFolderPicker({ title:'📦 Move to…', initial: cwd || '' });
       if (dest === null) return;
-      await apiJson('move', { paths: Array.from(selected), dest });
+      const paths = Array.from(selected);
+      const invalid = paths.some(p => {
+        const it = items.find(x => x.path === p);
+        if (!it) return false;
+        if (it.type === 'file') {
+          return parentDir(p) === dest;
+        }
+        if (it.type === 'dir') {
+          return isSameOrChild(dest, p);
+        }
+        return false;
+      });
+      if (invalid) {
+        showToast('Source and destination are the same.');
+        return;
+      }
+      await apiJson('move', { paths, dest });
+      fixCwdAfterMove(paths, dest);
+      rebuildTreeStateAfterMove(dest);
+      await new Promise(r => setTimeout(r, 100));
       await refreshAll();
       showToast('Moved.');
       return;
@@ -2059,7 +2527,18 @@ ctx.addEventListener('click', async (e)=>{
       if (!selected.size) return showToast('Nothing selected.');
       const dest = await openFolderPicker({ title:'📄 Copy to…', initial: cwd || '' });
       if (dest === null) return;
-      await apiJson('copy', { paths: Array.from(selected), dest });
+      const paths = Array.from(selected);
+      for (const p of paths) {
+        const it = items.find(x => x.path === p);
+        if (it?.type === 'dir' && isSameOrChild(dest, p)) {
+          showToast('Cannot copy a folder into itself or its subfolder.');
+          return;
+        }
+      }
+      await apiJson('copy', { paths, dest });
+      fixCwdAfterMove(paths, dest);
+      rebuildTreeStateAfterMove(dest);
+      await new Promise(r => setTimeout(r, 100));
       await refreshAll();
       showToast('Copied.');
       return;
@@ -2068,9 +2547,14 @@ ctx.addEventListener('click', async (e)=>{
     if (act === 'delete') {
       hideCtx();
       if (!confirm(`Really delete? (${selected.size})`)) return;
-      await apiJson('delete', {paths: Array.from(selected)});
+      const paths = Array.from(selected);
+      await apiJson('delete', { paths });
       selected.clear();
       setSelectedTag();
+      updateHeaderButtons();
+      fixCwdAfterMove(paths, parentDir(cwd));
+      rebuildTreeStateAfterMove(parentDir(cwd));
+      await new Promise(r => setTimeout(r, 30))
       await refreshAll();
       showToast('Deleted.');
       return;
@@ -2078,8 +2562,23 @@ ctx.addEventListener('click', async (e)=>{
 
     if (act === 'zip') {
       hideCtx();
-      if (!selected.size) { selected.add(ctxItem.path); setSelectedTag(); }
-      document.getElementById('btnZip').click();
+      if (!selected.size) return;
+      try {
+        showSpinner();
+        elStatus.textContent = 'Creating ZIP…';
+        await apiJson('zipCreate', {
+          cwd,
+          paths: Array.from(selected)
+        });
+        hideSpinner();
+        elStatus.textContent = 'Ready.';
+        await refreshAll();
+        showToast('ZIP created.');
+      } catch (err) {
+        hideSpinner();
+        elStatus.textContent = 'Ready.';
+        showToast('ZIP: ' + err.message, 4000);
+      }
       return;
     }
 
@@ -2102,6 +2601,8 @@ ctx.addEventListener('click', async (e)=>{
         });
         if (!policy) {
           showToast('Extraction canceled.');
+          hideSpinner();
+          elStatus.textContent = 'Ready.';
           return;
         }
         showSpinner();
@@ -2115,6 +2616,8 @@ ctx.addEventListener('click', async (e)=>{
         throw err;
       }
     }
+    rebuildTreeStateAfterMove(cwd || '');
+    await new Promise(r => setTimeout(r, 100));
     await refreshAll();
     hideSpinner();
     showToast('ZIP extracted.');
@@ -2127,25 +2630,69 @@ ctx.addEventListener('click', async (e)=>{
         showToast('Please select exactly 1 item to share.');
         return;
       }
-      const j = await apiJson('shareCreate', { paths: Array.from(selected) });
-      const url = j.url;
-      let copied = false;
-      if (navigator.clipboard && window.isSecureContext) {
-        try { await navigator.clipboard.writeText(url); copied = true; } catch {}
+      let token = null;
+      try {
+        const j = await apiJson('shareCreate', { paths: Array.from(selected) });
+        const url = j.url;
+        token = j.token;
+        let copied = false;
+        if (navigator.clipboard && window.isSecureContext) {
+          try {
+            await navigator.clipboard.writeText(url);
+            copied = true;
+          } catch {}
+        }
+        if (!copied) {
+          const res = prompt('Copy Share-Link:', url);
+          if (res === null && token) {
+            await apiJson('shareRevoke', { token });
+            showToast('Share-Link creation canceled.');
+            return;
+          }
+        }
+        showToast(copied ? '🔗 Share-Link copied.' : '🔗 Share-Link created.', 4000);
+        return;
+      } catch (err) {
+        if (token) {
+          try { await apiJson('shareRevoke', { token }); } catch {}
+        }
+        showToast('Share: ' + (err?.message || err), 4000);
+        return;
       }
-      if (!copied) {
-        prompt('Share-Link copied:', url);
-      }
-      showToast(copied ? '🔗 Share-Link copied.' : '🔗 Show Share-Link.', 5000);
-      return;
     }
   } catch (err) {
-    hideCtx();
-    showToast('Action: ' + (err?.message || err), 4000);
+    showToast('Action failed: ' + (err?.message || err), 4000);
   }
 });
 
+const ACTIONS = {
+  download: () => document.getElementById('btnDownload').click(),
+  rename: () => document.getElementById('btnRename')?.click(),
+  copy:   () => document.getElementById('btnCopy')?.click(),
+  move:   () => document.getElementById('btnMove')?.click(),
+  delete: () => document.getElementById('btnDelete').click(),
+  zip:    () => document.getElementById('btnZip').click(),
+  unzip:  () => document.getElementById('btnUnzip')?.click(),
+  share:  () => document.getElementById('btnShare').click()
+};
+
 // Init
-openDir('');
-loadTree();
-})();
+document.addEventListener('DOMContentLoaded', () => {
+  (async () => {
+    try {
+      if (window.IS_ADMIN) {
+        await openDir('');
+      } else {
+        const j = await apiJson('treeRoot');
+        if (j.nodes?.[0]) {
+          await openDir(j.nodes[0].path);
+        } else {
+          showToast('No folders assigned.');
+        }
+      }
+      await refreshRootSize();
+    } catch (e) {
+      showToast('Init failed: ' + e.message, 5000);
+    }
+  })();
+});
