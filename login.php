@@ -59,24 +59,9 @@ function csrf_check(?string $t): bool {
   return isset($_SESSION['_csrf']) && is_string($t) && hash_equals($_SESSION['_csrf'], $t);
 }
 
-function auth_is_logged_in(): bool {
-  auth_start_session();
-  return !empty($_SESSION['auth_ok']) && $_SESSION['auth_ok'] === true;
-}
-
 function auth_current_user(): string {
   auth_start_session();
   return (string)($_SESSION['auth_user'] ?? '');
-}
-
-function auth_is_admin(): bool {
-  if (!auth_is_logged_in()) return false;
-  $u = auth_current_user();
-  if ($u === '') return false;
-  $db = auth_db();
-  $entry = $db['users'][$u] ?? null;
-  if (!is_array($entry)) return false;
-  return (($entry['role'] ?? '') === 'admin');
 }
 
 function auth_require_or_render_login(): void {
@@ -223,11 +208,10 @@ function auth_require_or_render_login(): void {
       </div>
     </div>
   </div>
-<footer><?= htmlspecialchars(APP_TITLE) ?> V.1.0 © 2026 by Kevin Tobler - <a href='https://kevintobler.ch' target='_blank'>www.kevintobler.ch</a></footer>
+<div class="spacer"></div>
+<footer><?= htmlspecialchars(APP_TITLE) ?> V.1.1 © 2026 by Kevin Tobler - <a href='https://kevintobler.ch' target='_blank'>www.kevintobler.ch</a></footer>
 </body>
 </html>
 <?php
   exit;
 }
-
-auth_require_or_render_login();
