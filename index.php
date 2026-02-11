@@ -7,8 +7,76 @@
  */
 
 declare(strict_types=1);
+require_once 'inc/config.php';
+require_once 'inc/functions.php';
+
+$uiError = null;
+
+try {
+  require_user_roots();
+}
+catch (RuntimeException $e) {
+  if ($e->getMessage() === 'NO_RIGHTS') {
+    $uiError = 'No folder permissions assigned. Please contact the administrator.';
+  } else {
+    throw $e;
+  }
+}
+
+if (
+    isset($_GET['action'], $_GET['dl']) &&
+    $_GET['action'] === 'download'
+) {
+    $token = $_GET['dl'];
+    $db = downloads_db();
+    if (!isset($db[$token])) {
+        http_response_code(403);
+        exit('Invalid or expired download token');
+    }
+    $entry = $db[$token];
+    $tmp   = $entry['tmp'];
+    $name  = $entry['name'];
+    while (ob_get_level()) ob_end_clean();
+    header('Content-Type: application/zip');
+    header('Content-Disposition: attachment; filename="'.rawurlencode($name).'"');
+    header('Content-Length: '.filesize($tmp));
+    readfile($tmp);
+    @unlink($tmp);
+    unset($db[$token]);
+    downloads_save($db);
+    exit;
+}
+
 error_reporting(E_ALL);
-ini_set('display_errors', '0');
+ini_set('display_errors', '1');
+set_error_handler(function($no, $str, $file, $line) {
+  http_response_code(500);
+  header('Content-Type: application/json');
+  echo json_encode([
+    'ok' => false,
+    'php_error' => $str,
+    'file' => basename($file),
+    'line' => $line,
+  ]);
+  exit;
+});
+
+set_exception_handler(function(Throwable $e) {
+  if (!headers_sent() && isset($_GET['api'])) {
+    http_response_code(500);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode([
+      'ok' => false,
+      'exception' => $e->getMessage(),
+      'file' => basename($e->getFile()),
+      'line' => $e->getLine(),
+    ]);
+  } else {
+    http_response_code(500);
+    echo '<h1>Internal error</h1>';
+  }
+  exit;
+});
 
 header('X-Content-Type-Options: nosniff');
 header('X-Frame-Options: SAMEORIGIN');
@@ -24,17 +92,22 @@ if ($https) {
   header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
 }
 
-require_once 'inc/config.php';
-require_once 'inc/functions.php';
 require_once 'login.php';
 
-auth_require_or_render_login();
+if (
+  !isset($_GET['share']) &&
+  !(isset($_GET['action'], $_GET['dl']) && $_GET['action'] === 'download')
+) {
+  auth_require_or_render_login();
+}
+
+$rootTotalSize = format_bytes(dir_total_size(''));
 ?>
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=0.6">
   <title><?= htmlspecialchars(APP_TITLE) ?></title>
   <meta name="description" content="Dropzone File Explore is a simple, self-hosted file manager designed for performance, usability and security. It allows you to browse, upload, manage and share files directly in the browser – without a database and without external dependencies.">
   <link rel="icon" href="img/favicon.png">
@@ -50,10 +123,19 @@ auth_require_or_render_login();
         <div style="height: 96px;"><a href="index.php"><img src="img/logo.png" alt="Dropzone File Explorer" width="295"></a></div>
       </header>
       <div class="panel-fixed">
+      <?php if (AUTH_ENABLE && !auth_is_admin()): ?><button class="btn" id="btnMyPw">🔑 Change Password</button><?php endif; ?>
+      <?php if (AUTH_ENABLE && auth_is_admin()): ?><button class="btn secondary" id="btnUsers">👤 Manage Users</button><?php endif; ?>
+      <?php if (AUTH_ENABLE): ?><button class="btn danger" onclick="location.href='?logout=1'">🚪 Logout</button><?php endif; ?>
+      <hr>
+      <div id="rootSize" class="small" style="margin-left: 5px;">📦 Storage used: <?= htmlspecialchars($rootTotalSize) ?></div>
+      <?php if (!empty($uiError)): ?>
+        <div class="small" style="margin-left: 5px;">⚠️ <?= htmlspecialchars($uiError) ?></div>
+      <?php endif; ?>
+      <hr>
       <button class="btn primary" id="btnRefreshTree"><b>↻ Reload</b></button>
       </div>
       </div>
-      <div class="panel-scroll">
+      <div class="panel-scroll-tree">
       <div class="tree" id="tree"></div>
       </div>
     </section>
@@ -67,21 +149,23 @@ auth_require_or_render_login();
           <div class="crumbs" id="crumbs"></div>
           <div class="small" id="pathInfo" style="margin-top: 8px;"></div>
         </div>
-
         <div class="row header-actions">
-          <button class="btn primary" id="btnUpload">⬆ Upload • <b>Shift + Click</b> for folders</button>
+          <button class="btn primary" id="btnUpload">⬆ Upload<b>•</b><b>Shift + Click</b>for folders</button>
+          <button class="btn primary" id="btnDownload">⬇ Download</button>
           <button class="btn" id="btnNewFolder">📁 New Folder</button>
-          <button class="btn" id="btnZip">🗜 Create ZIP</button>
-          <button class="btn" id="btnShare">🔗 Create Share-Link</button>
-          <button class="btn" id="btnShares">🔗 Manage Share-Links</button>
+          <button class="btn" id="btnRename">✏️ Rename</button>
+          <button class="btn" id="btnCopy">📄 Copy</button>
+          <button class="btn" id="btnMove">📦 Move</button>
           <button class="btn danger" id="btnDelete">🗑 Delete</button>
-          <?php if (AUTH_ENABLE && !auth_is_admin()): ?><button class="btn" id="btnMyPw">🔑 Change Password</button><?php endif; ?>
-          <?php if (AUTH_ENABLE && auth_is_admin()): ?><button class="btn" id="btnUsers">👤 Manage Users</button><?php endif; ?>
-          <?php if (AUTH_ENABLE): ?><button class="btn danger" onclick="location.href='?logout=1'">🚪 Logout</button><?php endif; ?>
+          <button class="btn" id="btnZip">🗜 Create ZIP</button>
+          <button class="btn" id="btnUnzip">📦 Extract ZIP</button>
+          <button class="btn" id="btnShare">🔗 Create Share</button>
+          <button class="btn" id="btnShares">🔗 Manage Shares</button>
         </div>
       </div>
     </header>
     <div class="panel-fixed">
+      <div class="hideDropzone">
         <div class="dropzone" id="dropzone">
           <div>
             <div style="font-weight:700">Drag & Drop Upload</div>
@@ -93,6 +177,7 @@ auth_require_or_render_login();
             <button class="btn danger" id="btnCancel" style="display:none">✖ Cancel</button>
           </div>
         </div>
+      </div>
 
         <div id="uploads" style="display:grid; gap:10px;"></div>
 
@@ -102,7 +187,7 @@ auth_require_or_render_login();
         </div>
 
         <div style="margin-top: 8px; margin-bottom: 8px;">
-        <input type="text" id="search" placeholder="Search in folders… (name contains)">
+        <input type="text" id="search" placeholder="Search in folder… (name contains)">
         </div>
         </div>
       </div>
@@ -129,7 +214,6 @@ auth_require_or_render_login();
       <header>
         <div class="title">Preview & Editor</div>
         <div class="row">
-          <button class="btn" id="btnDownload">⬇ Download</button>
           <button class="btn ok" id="btnSave">💾 Save</button>
         </div>
       </header>
@@ -150,7 +234,7 @@ auth_require_or_render_login();
           </div>
         </div>
 
-        <textarea class="editor" id="editor" placeholder="Editor… (öffnet nur Text-Dateien)" style="margin-top:10px"></textarea>
+        <textarea class="editor" id="editor" placeholder="Editor… (only Text-Files)" style="margin-top:10px"></textarea>
         <div class="small muted" style="padding:10px 0px 10px 0px">
           Tips: Multi-select with <span class="kbd">⌘</span> / <span class="kbd">Ctrl</span>. Double-click folders to open.
         </div>
@@ -163,12 +247,10 @@ auth_require_or_render_login();
   <button data-act="open">📂 Open</button>
   <button data-act="download">⬇ Download</button>
   <div class="sep"></div>
-
   <button data-act="rename">✏️ Rename</button>
   <button data-act="copy">📄 Copy…</button>
   <button data-act="move">📦 Move…</button>
   <button data-act="delete" class="danger">🗑 Delete</button>
-
   <div class="sep"></div>
   <button data-act="zip">🗜 Create ZIP</button>
   <button data-act="unzip">📦 Extract ZIP</button>
@@ -302,11 +384,12 @@ auth_require_or_render_login();
 </div>
 <div class="spacer"></div>
 <div class="toast" id="toast"></div>
-<footer><?= htmlspecialchars(APP_TITLE) ?> V.1.0 © 2026 by Kevin Tobler - <a href='https://kevintobler.ch' target='_blank'>www.kevintobler.ch</a></footer>
+<footer><?= htmlspecialchars(APP_TITLE) ?> V.1.1 © 2026 by Kevin Tobler - <a href='https://kevintobler.ch' target='_blank'>www.kevintobler.ch</a></footer>
 <script>
   window.APP_CONFIG = { CHUNK_SIZE: <?= (int)CHUNK_SIZE_DEFAULT ?> };
+  window.IS_ADMIN = <?= auth_is_admin() ? 'true' : 'false' ?>;
+  window.IS_SHARE_VIEW = <?= defined('IS_PUBLIC_SHARE') && IS_PUBLIC_SHARE ? 'true' : 'false' ?>;
 </script>
 <script src="js/main.js" defer></script>
 </body>
 </html>
-
