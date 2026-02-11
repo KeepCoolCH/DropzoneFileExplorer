@@ -1,13 +1,22 @@
 # 📤 Dropzone File Explorer
 
 **Dropzone File Explorer** is a simple, self-hosted file manager designed for performance, usability and security. It allows you to browse, upload, manage and share files directly in the browser – without a database and without external dependencies.
-Version **1.0** – developed by Kevin Tobler 🌐 [www.kevintobler.ch](https://www.kevintobler.ch) – 🌐 [github.com/KeepCoolCH/DropzoneFileExplorer](https://github.com/KeepCoolCH/DropzoneFileExplorer) – 🌐 [hub.docker.com/keepcoolch/dropzonefileexplorer](https://hub.docker.com/r/keepcoolch/dropzonefileexplorer)
+Version **1.1** – developed by Kevin Tobler 🌐 [www.kevintobler.ch](https://www.kevintobler.ch) – 🌐 [github.com/KeepCoolCH/DropzoneFileExplorer](https://github.com/KeepCoolCH/DropzoneFileExplorer) – 🌐 [hub.docker.com/keepcoolch/dropzonefileexplorer](https://hub.docker.com/r/keepcoolch/dropzonefileexplorer)
 
 ---
 
 ## 🔄 Changelog
 
 ### 🆕 Version 1.x
+- **1.1**
+  - 📦 Improved ZIP creation & extraction (more reliable, faster, better edge-case handling)
+  - 📊 File & folder size calculation with automatic total size display
+  - 👥 User management with per-folder access rights
+  - 🔗 Share links with dedicated share page
+  - 👁️ File preview directly inside share page
+  - 🎨 Multiple UI / UX improvements
+  - 🔧 API improvements & internal refactoring
+  - 🐞 Various bug fixes and stability improvements
 - **1.0**
   - First Release, details below
 
@@ -20,14 +29,16 @@ Version **1.0** – developed by Kevin Tobler 🌐 [www.kevintobler.ch](https:/
 - 📦 Automatic chunked uploads (large files supported)
 - ⏸️ Pause & resume uploads
 - 📊 Upload progress with speed indicator
+- 📏 File & folder size display (including total folder size)
 - 🔍 Live search (search in folders, name contains)
 - 🗂️ Create, rename, move, copy and delete files & folders
 - 📎 ZIP creation & extraction
 - 👁️ Preview support (Images, Videos, Audio, PDF, Text files)
 - ✏️ Inline text editor with save support
 - 🔗 Share links for files & folders
-- 🔐 Optional login / authentication
-- 🧑‍💻 Optional multi-user support
+- 📄 Dedicated share page with preview support
+- 👥 Optional login & user management
+- 🔐 Per-user folder permissions
 - 🚫 No database required – pure PHP
 - ⚡ Optimized for modern browsers
 - 📱 Responsive UI
@@ -36,13 +47,13 @@ Version **1.0** – developed by Kevin Tobler 🌐 [www.kevintobler.ch](https:/
 
 ## 📸 Screenshot
 
-![Screenshot](https://online.kevintobler.ch/projectimages/DropzoneFileExplorerV1-0.png)
+![Screenshot](https://online.kevintobler.ch/projectimages/DropzoneFileExplorerV1-1.png)
 
 ---
 
-## 🐳 Docker Installation (Version 1.0)
+## 🐳 Docker Installation (Version 1.1)
 
-Dropzone File Explorer **V.1.0** is available as a Docker image:
+Dropzone File Explorer **V.1.1** is available as a Docker image:
 
 ```bash
 docker pull keepcoolch/dropzonefileexplorer:latest
@@ -134,7 +145,7 @@ docker compose up -d
 
 - Chunked uploads for large files
 - Automatic resume if upload is interrupted
-- Parallel uploads with queue management
+- Parallel upload queue
 - Optional overwrite / rename handling
 - Folder uploads supported via browser APIs
 
@@ -151,8 +162,8 @@ docker compose up -d
 
 ### Supported previews
 - 🖼️ Images (PNG, JPG, WebP, SVG, HEIC, …)
-- 🎥 Videos (MP4, WebM, MOV)
-- 🎧 Audio (MP3, WAV, AAC)
+- 🎥 Videos (MP4, WebM, MOV, …)
+- 🎧 Audio (MP3, WAV, AAC, …)
 - 📄 PDF
 - 📝 Text files (code & config files supported)
 
@@ -177,13 +188,13 @@ docker compose up -d
 
 ---
 
-## 🔐 Authentication (Optional)
+## 🔐 Authentication
 
 - Session-based login
 - Passwords are securely hashed
 - Supports: admin account, additional users
 - User management via UI
-- Change passwords without server access
+- Change passwords via UI
 
 ---
 
