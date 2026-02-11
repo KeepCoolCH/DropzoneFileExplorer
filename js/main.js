@@ -1740,6 +1740,7 @@ document.getElementById('btnDelete').addEventListener('click', async ()=>{
     rebuildTreeStateAfterMove(parentDir(cwd));
     await new Promise(r => setTimeout(r, 100));
     await refreshAll();
+    showToast('Deleted.');
   }
   catch(err){ showToast('Delete: ' + err.message, 3500); }
 });
