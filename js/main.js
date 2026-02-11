@@ -1691,7 +1691,7 @@ document.getElementById('btnNewFolder').addEventListener('click', async ()=>{
     selected.clear();
     setSelectedTag();
     updateHeaderButtons();
-    showToast('ZIP extracted.');
+    showToast('Folder created.');
       }
   catch(err){ showToast('Mkdir: ' + err.message, 3500); }
 });
