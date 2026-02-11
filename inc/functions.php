@@ -1,6 +1,270 @@
 <?php
+require_once 'inc/config.php';
 require_once 'login.php';
 
+// --- SESSION START (API + UI) ---
+if (
+  session_status() !== PHP_SESSION_ACTIVE &&
+  !(isset($_GET['action'], $_GET['dl']) && $_GET['action'] === 'download')
+) {
+  auth_start_session();
+}
+
+function require_user_roots(): void {
+  if (!auth_is_logged_in()) return;
+  if (auth_is_admin()) return;
+  if (!user_effective_roots()) {
+    throw new RuntimeException('NO_RIGHTS');
+  }
+}
+
+function auth_is_logged_in(): bool {
+  return AUTH_ENABLE && !empty($_SESSION['auth_user']);
+}
+
+function auth_is_admin(): bool {
+  if (!AUTH_ENABLE || empty($_SESSION['auth_user'])) return false;
+  $db = auth_db();
+  $u  = $_SESSION['auth_user'];
+  return (($db['users'][$u]['role'] ?? '') === 'admin');
+}
+
+// -------------------- PUBLIC SHARE --------------------
+// --- PUBLIC ZIP DOWNLOAD ---
+if (
+  isset($_GET['action'], $_GET['dl']) &&
+  $_GET['action'] === 'download'
+) {
+  return;
+}
+define('IS_PUBLIC_SHARE', isset($_GET['share']));
+
+// --- SHARE STATS ---
+function share_total_size(string $shareRootAbs): int {
+  ensure_inside_root($shareRootAbs);
+  if (is_file($shareRootAbs)) {
+    return filesize($shareRootAbs) ?: 0;
+  }
+  $total = 0;
+  $it = new RecursiveIteratorIterator(
+    new RecursiveDirectoryIterator(
+      $shareRootAbs,
+      FilesystemIterator::SKIP_DOTS
+    )
+  );
+  foreach ($it as $f) {
+    if ($f->isDir()) continue;
+    if (!$f->isReadable()) continue;
+    if (is_excluded_file($f->getFilename())) continue;
+    ensure_inside_share($f->getPathname(), $shareRootAbs);
+    $total += $f->getSize();
+  }
+  return $total;
+}
+
+// -------------------- ACTION --------------------
+$action = (string)($_GET['action'] ?? $_POST['action'] ?? '');
+
+// -------------------- USER ACL --------------------
+function user_effective_roots(): array {
+  if (!auth_is_logged_in()) return [];
+  if (auth_is_admin()) return [''];
+  $db = auth_db();
+  $u  = $_SESSION['auth_user'];
+  $info = $db['users'][$u] ?? [];
+  $valid = [];
+  foreach (($info['folders'] ?? []) as $rel => $mode) {
+    $rel = trim(norm_rel($rel), '/');
+    if ($rel === '' || str_contains($rel, '..')) continue;
+    if (is_dir(abs_path($rel))) {
+      $valid[] = $rel;
+    }
+  }
+  return $valid;
+}
+
+function user_allowed_roots(): array {
+  if (!AUTH_ENABLE || empty($_SESSION['auth_user'])) {
+    return [''];
+  }
+  $db = auth_db();
+  $u  = $_SESSION['auth_user'];
+  $info = $db['users'][$u] ?? [];
+  if (($info['role'] ?? '') === 'admin') {
+    return [''];
+  }
+  $paths = [];
+  foreach ((array)($info['folders'] ?? []) as $rel => $mode) {
+    $rel = trim(norm_rel($rel), '/');
+    if ($rel === '' || str_contains($rel, '..')) continue;
+    $paths[] = $rel;
+  }
+  sort($paths, SORT_STRING);
+  $roots = [];
+  foreach ($paths as $p) {
+    foreach ($roots as $r) {
+      if ($p === $r || str_starts_with($p.'/', $r.'/')) {
+        continue 2;
+      }
+    }
+    $roots[] = $p;
+  }
+  return $roots;
+}
+
+// -------------------- SAFE AUTH SAVE --------------------
+function auth_save_safe(array $db): void {
+  $file = AUTH_FILE;
+  $tmp  = $file . '.tmp';
+  $dir = dirname($file);
+  if (!is_dir($dir)) {
+    @mkdir($dir, 0775, true);
+  }
+  $json = json_encode(
+    $db,
+    JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
+  );
+  if ($json === false) {
+    throw new RuntimeException('JSON encode failed');
+  }
+  file_put_contents($tmp, $json, LOCK_EX);
+  rename($tmp, $file);
+}
+
+// -------------------- ACL CLEANUP --------------------
+function cleanup_dead_user_folders(): array {
+  $db = auth_db();
+  $removed = [];
+  foreach ($db['users'] as $user => &$info) {
+    if (($info['role'] ?? '') !== 'user') continue;
+    if (empty($info['folders']) || !is_array($info['folders'])) continue;
+    foreach ($info['folders'] as $rel => $mode) {
+      $rel = trim(norm_rel($rel), '/');
+      if ($rel === '' || !is_dir(abs_path($rel))) {
+        unset($info['folders'][$rel]);
+        $removed[$user][] = $rel;
+      }
+    }
+    if (empty($info['folders'])) {
+      unset($info['folders']);
+    }
+  }
+  unset($info);
+  if ($removed) {
+    auth_save_safe($db);
+  }
+  return $removed;
+}
+
+// -------------------- REVOKE ACLs FOR DELETED PATH --------------------
+function revoke_acl_for_deleted_path(string $rel): void {
+  $rel = trim(norm_rel($rel), '/');
+  if ($rel === '') return;
+  $db = auth_db();
+  $changed = false;
+  foreach ($db['users'] as $user => &$info) {
+    if (($info['role'] ?? '') !== 'user') continue;
+    if (empty($info['folders']) || !is_array($info['folders'])) continue;
+    foreach (array_keys($info['folders']) as $aclPath) {
+      $aclPath = trim(norm_rel($aclPath), '/');
+      if ($aclPath === $rel || str_starts_with($aclPath . '/', $rel . '/')) {
+        unset($info['folders'][$aclPath]);
+        $changed = true;
+      }
+    }
+    if (empty($info['folders'])) {
+      unset($info['folders']);
+    }
+  }
+  unset($info);
+  if ($changed) {
+    auth_save_safe($db);
+  }
+}
+
+function realpath_first_existing(string $path): string|false {
+  $path = rtrim($path, DIRECTORY_SEPARATOR);
+  while ($path !== '' && $path !== DIRECTORY_SEPARATOR) {
+    if (file_exists($path)) {
+      return realpath($path);
+    }
+    $path = dirname($path);
+  }
+  return false;
+}
+
+function ensure_inside_allowed_roots(string $abs): void {
+  if (auth_is_admin()) return;
+  $rootAbs = realpath(ROOT_DIR);
+  if ($rootAbs === false) {
+    jsend(['ok'=>false,'error'=>'Root missing'], 500);
+  }
+  $abs = realpath($abs);
+  if ($abs === false) {
+    jsend(['ok'=>false,'error'=>'Invalid path'], 400);
+  }
+  $rootAbs = rtrim($rootAbs, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+  $abs     = rtrim($abs, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+  if (strpos($abs, $rootAbs) !== 0) {
+    jsend(['ok'=>false,'error'=>'Access denied'], 403);
+  }
+  $rel = norm_rel(substr($abs, strlen($rootAbs)));
+  foreach (user_allowed_roots() as $rootRel) {
+    $rootRel = rtrim($rootRel, '/');
+    if ($rel === $rootRel) {
+      return;
+    }
+    if (str_starts_with($rel.'/', $rootRel.'/')) {
+      return;
+    }
+  }
+  jsend(['ok'=>false,'error'=>'Access denied'], 403);
+}
+
+function ensure_write_allowed(string $rel): void {
+  if (!AUTH_ENABLE || empty($_SESSION['auth_user'])) return;
+  $db = auth_db();
+  $u  = $_SESSION['auth_user'];
+  $info = $db['users'][$u] ?? [];
+  if (($info['role'] ?? '') === 'admin') return;
+  $rel = trim(norm_rel($rel), '/');
+  foreach (($info['folders'] ?? []) as $path => $mode) {
+    $path = trim($path, '/');
+    if ($mode === 'write' && ($rel === $path || str_starts_with($rel.'/', $path.'/'))) {
+      return;
+    }
+  }
+  jsend(['ok'=>false,'error'=>'Write access denied'], 403);
+}
+
+function ensure_target_inside_allowed_roots(string $absTarget): void {
+  if (auth_is_admin()) return;
+  $root = realpath(ROOT_DIR);
+  if ($root === false) {
+    jsend(['ok'=>false,'error'=>'Root missing'], 500);
+  }
+  $root = rtrim($root, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+  $probe = $absTarget;
+  while (true) {
+    if (file_exists($probe)) {
+      ensure_inside_allowed_roots($probe);
+      return;
+    }
+    $parent = dirname($probe);
+    if ($parent === $probe) break;
+    $parentReal = realpath($parent);
+    if ($parentReal !== false) {
+      $parentReal = rtrim($parentReal, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+      if (strpos($parentReal, $root) !== 0) {
+        jsend(['ok'=>false,'error'=>'Invalid path'], 400);
+      }
+    }
+    $probe = $parent;
+  }
+  jsend(['ok'=>false,'error'=>'Invalid path'], 400);
+}
+
+// -------------------- JSON --------------------
 function jsend(array $data, int $code = 200): void {
   while (ob_get_level()) ob_end_clean();
   http_response_code($code);
@@ -17,7 +281,7 @@ const FILE_EXCLUDES = [
 ];
 
 const FILE_EXCLUDE_PREFIXES = [
-    '._',          // AppleDouble files
+    '._',
 ];
 
 function is_excluded_file(string $name): bool {
@@ -82,9 +346,12 @@ function is_hidden(string $name): bool {
 }
 
 function list_dir(string $rel): array {
+  if ($rel === '' && !auth_is_admin()) {
+    return [];
+  }
   $abs = abs_path($rel);
   if (!is_dir($abs)) jsend(['ok'=>false,'error'=>'Not a directory'], 400);
-  ensure_inside_root($abs);
+  ensure_inside_allowed_roots($abs);
   $items = [];
   $dh = opendir($abs);
   if (!$dh) jsend(['ok'=>false,'error'=>'Cannot open dir'], 500);
@@ -113,7 +380,10 @@ function list_dir(string $rel): array {
 function build_tree(string $rel = ''): array {
   $abs = abs_path($rel);
   if (!is_dir($abs)) return [];
-  ensure_inside_root($abs);
+  if ($rel === '' && !auth_is_admin()) {
+    return [];
+  }
+  ensure_inside_allowed_roots($abs);
   $nodes = [];
   $dh = @opendir($abs);
   if (!$dh) return [];
@@ -151,23 +421,33 @@ function has_dir_children(string $rel): bool {
 
 function rrmdir(string $dir): bool {
   if (!is_dir($dir)) return false;
-
   $it = new RecursiveIteratorIterator(
     new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS),
     RecursiveIteratorIterator::CHILD_FIRST
   );
-
   foreach ($it as $file) {
     $path = $file->getPathname();
-
     if ($file->isDir()) {
       if (!@rmdir($path)) return false;
     } else {
       if (!@unlink($path)) return false;
     }
   }
-
   return @rmdir($dir);
+}
+
+function tmp_gc(int $maxAge = 3600): void {
+  if (!is_dir(FILE_TMP_DIR)) return;
+  foreach (glob(FILE_TMP_DIR . '/*') ?: [] as $p) {
+    if (!file_exists($p)) continue;
+    if (time() - filemtime($p) > $maxAge) {
+      if (is_dir($p)) {
+        rrmdir($p);
+      } else {
+        @unlink($p);
+      }
+    }
+  }
 }
 
 function rrcopy(string $src, string $dst): void {
@@ -217,6 +497,22 @@ function shares_save(array $db): void {
   @file_put_contents(shares_db_path(), json_encode($db, JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT), LOCK_EX);
 }
 
+// -------------------- SHARE DB MIGRATION --------------------
+if (AUTH_ENABLE) {
+  $db = shares_db();
+  $changed = false;
+  foreach ($db as &$e) {
+    if (!array_key_exists('owner', $e)) {
+      $e['owner'] = null;
+      $changed = true;
+    }
+  }
+  unset($e);
+  if ($changed) {
+    shares_save($db);
+  }
+}
+
 function downloads_db_path(): string {
   return STORAGE_DIR . '/tmp/downloads.json';
 }
@@ -255,40 +551,7 @@ function detect_mime(string $abs): string {
   $finfo = finfo_open(FILEINFO_MIME_TYPE);
   if (!$finfo) return 'application/octet-stream';
   $m = finfo_file($finfo, $abs);
-  finfo_close($finfo);
   return $m ?: 'application/octet-stream';
-}
-
-function zip_cli(string $zipAbs, array $absPaths): void {
-ignore_user_abort(true);
-set_time_limit(0);
-  $root = realpath(ROOT_DIR);
-  if ($root === false) {
-    throw new RuntimeException('ROOT_DIR invalid');
-  }
-  $zipAbs = escapeshellarg($zipAbs);
-  if (trim(shell_exec('command -v bsdtar'))) {
-    $cmd = "bsdtar -cf $zipAbs --format=zip" . " --exclude=.DS_Store" . " --exclude=._*" . " --exclude=__MACOSX" . " --exclude=Thumbs.db" . " -C " . escapeshellarg($root);
-    foreach ($absPaths as $p) {
-      $real = realpath($p);
-      if ($real === false || strpos($real, $root . DIRECTORY_SEPARATOR) !== 0) {
-        throw new RuntimeException('Path outside ROOT_DIR');
-      }
-      $rel = ltrim(substr($real, strlen($root)), DIRECTORY_SEPARATOR);
-      $cmd .= " " . escapeshellarg($rel);
-    }
-  } else {
-    $cmd = "cd " . escapeshellarg($root) . " && zip -0 -r $zipAbs" . " -x '*.DS_Store' '._*' '__MACOSX/*' 'Thumbs.db'";
-    foreach ($absPaths as $p) {
-      $real = realpath($p);
-      $rel  = ltrim(substr($real, strlen($root)), DIRECTORY_SEPARATOR);
-      $cmd .= " " . escapeshellarg($rel);
-    }
-  }
-  exec($cmd . " 2>&1", $out, $rc);
-  if ($rc !== 0 || !is_file(trim($zipAbs, "'"))) {
-    throw new RuntimeException("ZIP CLI failed:\n" . implode("\n", $out));
-  }
 }
 
 function chunk_dir(string $uploadId): string {
@@ -303,65 +566,768 @@ function read_json_body(): array {
   return is_array($j) ? $j : [];
 }
 
-// -------------------- SHARE ROUTE --------------------
-if (isset($_GET['share'])) {
-  $t = preg_replace('~[^a-zA-Z0-9_\-]~', '', (string)$_GET['share']);
-  $db = shares_db();
-  if (!isset($db[$t])) {
-    http_response_code(404); echo 'Not found'; exit;
-  }
+// ---------- SHARE DOWNLOAD PREPARED (FILE RESPONSE) ----------
+if (
+  isset($_GET['share']) &&
+  $action === 'shareDownloadPrepared' &&
+  isset($_GET['token'])
+) {
+  $dl = preg_replace('~[^a-zA-Z0-9_\-]~', '', (string)$_GET['token']);
+  if ($dl === '') exit;
 
-  $entry = $db[$t];
-  $rel = (string)($entry['path'] ?? '');
-  $abs = abs_path($rel);
-  ensure_inside_root($abs);
+  $db = downloads_db();
+  if (!isset($db[$dl])) { http_response_code(404); exit; }
 
-  if (!file_exists($abs)) {
-    http_response_code(404); echo 'Gone'; exit;
-  }
+  $entry = $db[$dl];
+  $tmp   = (string)$entry['tmp'];
+  $name  = (string)($entry['name'] ?? 'download.zip');
 
-// If folder => Zip
-if (is_dir($abs)) {
-  $name = basename($abs) ?: 'download';
-  $tmpDir = STORAGE_DIR . '/tmp';
-  if (!is_dir($tmpDir)) @mkdir($tmpDir, 0775, true);
-  $tmp = $tmpDir . '/sharezip_' . bin2hex(random_bytes(8)) . '.zip';
-  try {
-    zip_cli($tmp, [$abs]);
-  } catch (Throwable $e) {
-    http_response_code(500);
-    echo 'ZIP creation failed';
-    exit;
-  }
+  if (!is_file($tmp)) { http_response_code(404); exit; }
 
+  while (ob_get_level()) ob_end_clean();
   header('Content-Type: application/zip');
-  header('Content-Disposition: attachment; filename="'.rawurlencode($name).'.zip"');
+  header('Content-Disposition: attachment; filename="'.rawurlencode($name).'"');
   header('Content-Length: '.filesize($tmp));
   header('X-Accel-Buffering: no');
-  while (ob_get_level()) ob_end_clean();
+
   readfile($tmp);
   @unlink($tmp);
+
+  unset($db[$dl]);
+  downloads_save($db);
   exit;
 }
 
-  // File => stream file
+// -------------------- SHARE API --------------------
+//---------- SHARE PREVIEW ----------
+if (
+  isset($_GET['share'], $_GET['api']) &&
+  $action === 'sharePreview'
+) {
+  $t = preg_replace('~[^a-zA-Z0-9_\-]~', '', (string)$_GET['share']);
+  $db = shares_db();
+  if (!isset($db[$t]['path'])) exit;
+  $sharedRel = norm_rel($db[$t]['path']);
+  $shareRoot = abs_path($sharedRel);
+  ensure_inside_root($shareRoot);
+  $rel = norm_rel((string)($_GET['path'] ?? ''));
+  $abs = is_file($shareRoot)
+    ? $shareRoot
+    : realpath($shareRoot . '/' . $rel);
+  if (!$abs || !is_file($abs)) exit;
+  ensure_inside_share($abs, $shareRoot);
   $mime = detect_mime($abs);
   header('Content-Type: '.$mime);
-  header('Content-Disposition: attachment; filename="'.rawurlencode(basename($abs)).'"');
   header('Content-Length: '.filesize($abs));
+  header('Content-Disposition: inline; filename="'.rawurlencode(basename($abs)).'"');
   readfile($abs);
   exit;
 }
 
-// -------------------- API ROUTES --------------------
-$isApi = isset($_GET['api']) || (isset($_POST['api'])) || (isset($_GET['action']) && $_GET['action'] !== '');
-if ($isApi) {
-  $action = (string)($_GET['action'] ?? $_POST['action'] ?? '');
-  $ct = (string)($_SERVER['CONTENT_TYPE'] ?? $_SERVER['HTTP_CONTENT_TYPE'] ?? '');
-  $body = [];
-  if (stripos($ct, 'application/json') !== false) {
-    $body = read_json_body();
+//---------- ZIP CREATE JOB ----------
+function zip_create_job(array $absPaths, string $label, string $baseDir, array $extraExcludes = []): array
+{
+    ignore_user_abort(true);
+    set_time_limit(0);
+
+    $extraExcludes = array_values(array_filter($extraExcludes, function ($p) {
+        $p = trim((string)$p);
+        return
+            $p !== '' &&
+            !str_contains($p, '..') &&
+            !str_starts_with($p, '/') &&
+            !str_contains($p, "\0");
+    }));
+
+    $allExcludes = array_values(array_unique(array_merge(
+        FILE_EXCLUDES,
+        array_map(fn($p) => rtrim($p, '/'), $extraExcludes)
+    )));
+
+    $token  = 'zip_' . bin2hex(random_bytes(8));
+    $tmpDir = FILE_TMP_DIR;
+    if (!is_dir($tmpDir)) mkdir($tmpDir, 0777, true);
+
+    $zipPath = $tmpDir . '/' . $token . '.zip';
+
+    $baseDir = rtrim(realpath($baseDir), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+
+    $cmd = 'cd ' . escapeshellarg($baseDir) . ' && zip -r -0 ' .
+           escapeshellarg($zipPath);
+
+    foreach ($absPaths as $abs) {
+        $abs = realpath($abs);
+        if (!$abs) continue;
+
+        $rel = substr($abs, strlen($baseDir));
+        if ($rel !== '') {
+            $cmd .= ' ' . escapeshellarg($rel);
+        }
+    }
+
+    foreach ($allExcludes as $ex) {
+        $cmd .= ' -x ' . escapeshellarg("*/$ex");
+        $cmd .= ' -x ' . escapeshellarg("*/$ex/*");
+    }
+
+    foreach (FILE_EXCLUDE_PREFIXES as $pre) {
+        $cmd .= ' -x ' . escapeshellarg("*/$pre*");
+    }
+    
+    $cmd .= ' 2>&1';
+
+    exec($cmd, $out, $rc);
+
+    if ($rc !== 0 || !is_file($zipPath)) {
+        @unlink($zipPath);
+        throw new RuntimeException(
+            "ZIP failed\nCMD: $cmd\nOUT:\n" . implode("\n", $out)
+        );
+    }
+
+    return [
+        'token' => $token,
+        'file'  => $zipPath,
+        'name'  => $label . '.zip',
+    ];
+}
+
+function ensure_inside_share(string $abs, string $shareRoot): void {
+  $real = realpath($abs);
+  $root = realpath($shareRoot);
+  if ($real === false || $root === false) {
+    jsend(['ok'=>false,'error'=>'Invalid path'], 400);
   }
+  $root = rtrim($root, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+  if (strpos($real . DIRECTORY_SEPARATOR, $root) !== 0) {
+    jsend(['ok'=>false,'error'=>'Path outside share'], 403);
+  }
+}
+
+if (isset($_GET['share'], $_GET['api'])) {
+
+  // ---------- READ TEXT (SHARE) ----------
+  if (
+    isset($_GET['share'], $_GET['api']) &&
+    $action === 'readText'
+  ) {
+    $body = read_json_body();
+    $t  = preg_replace('~[^a-zA-Z0-9_\-]~', '', (string)$_GET['share']);
+    $db = shares_db();
+    if (!isset($db[$t]['path'])) {
+      jsend(['ok'=>false,'error'=>'Invalid share'], 404);
+    }
+    $shareRel = norm_rel($db[$t]['path']);
+    $shareAbs = abs_path($shareRel);
+    ensure_inside_root($shareAbs);
+    $rel = norm_rel((string)($body['path'] ?? ''));
+    if (is_file($shareAbs)) {
+      $abs = $shareAbs;
+    } else {
+      if ($rel === '') {
+        jsend(['ok'=>false,'error'=>'Missing path'], 400);
+      }
+      $abs = realpath($shareAbs . '/' . $rel);
+    }
+    if (!$abs || !is_file($abs)) {
+      jsend(['ok'=>false,'error'=>'Not found'], 404);
+    }
+    ensure_inside_share($abs, $shareAbs);
+
+    if (filesize($abs) > SAFE_TEXT_MAX) {
+      jsend(['ok'=>false,'error'=>'File too large'], 400);
+    }
+    $txt = (string)@file_get_contents($abs);
+    jsend(['ok'=>true,'text'=>$txt]);
+  }
+
+  // ---------- SHARE BROWSE ----------
+  if ($action === 'shareBrowse') {
+    $t  = preg_replace('~[^a-zA-Z0-9_\-]~', '', (string)$_GET['share']);
+    $db = shares_db();
+    if (!isset($db[$t]['path'])) jsend(['ok'=>false],404);
+    $shared = norm_rel($db[$t]['path']);
+    $cwd    = norm_rel((string)($_GET['path'] ?? ''));
+    $absShared = abs_path($shared);
+    ensure_inside_root($absShared);
+    if (!file_exists($absShared)) {
+      jsend(['ok'=>true,'items'=>[]]);
+    }
+
+    // FILE SHARE
+    if (is_file($absShared)) {
+      $st = @stat($absShared);
+      jsend([
+        'ok'=>true,
+        'items'=>[[
+          'name'=>basename($shared),
+          'path'=>basename($shared),
+          'type'=>'file',
+          'size'  => (int)($st['size'] ?? 0),
+          'mtime' => (int)($st['mtime'] ?? 0),
+        ]]
+      ]);
+    }
+
+    // FOLDER SHARE
+    $root = $absShared;
+    $abs  = rtrim($root,'/') . ($cwd !== '' ? '/'.$cwd : '');
+    if (!file_exists($abs) || !is_dir($abs)) {
+      jsend(['ok'=>true,'items'=>[]]);
+    }
+    ensure_inside_root($abs);
+    $items = [];
+    foreach (scandir($abs) as $n) {
+      if ($n==='.' || $n==='..' || is_excluded_file($n)) continue;
+      $p = $abs.'/'.$n;
+      $isDir = is_dir($p);
+      $st = @stat($p);
+      $items[] = [
+        'name'=>$n,
+        'path'=>norm_rel(($cwd!=='' ? $cwd.'/' : '').$n),
+        'type'=>is_dir($p)?'dir':'file',
+        'size'  => $isDir ? 0 : (int)($st['size'] ?? 0),
+        'mtime' => (int)($st['mtime'] ?? 0),
+      ];
+    }
+    jsend(['ok'=>true,'items'=>$items]);
+  }
+
+  // ---------- SHARE DOWNLOAD FILE ----------
+  if ($action === 'shareDownloadFile') {
+    $t  = preg_replace('~[^a-zA-Z0-9_\-]~', '', (string)$_GET['share']);
+    $db = shares_db();
+    if (!isset($db[$t]['path'])) exit;
+    $shared = norm_rel($db[$t]['path']);
+    $absShared = abs_path($shared);
+    ensure_inside_root($absShared);
+    if (is_file($absShared)) {
+      $abs = $absShared;
+    } else {
+      $rel = norm_rel((string)$_GET['path']);
+      if ($rel === '') exit;
+      $abs = rtrim($absShared,'/').'/'.$rel;
+    }
+    ensure_inside_root($abs);
+    if (!is_file($abs)) exit;
+    while (ob_get_level()) ob_end_clean();
+    header('Content-Type: '.detect_mime($abs));
+    header('Content-Disposition: attachment; filename="'.rawurlencode(basename($abs)).'"');
+    header('Content-Length: '.filesize($abs));
+    readfile($abs);
+    exit;
+  }
+
+  // ---------- SHARE DOWNLOAD PREPARE ----------
+  if ($action === 'shareDownloadPrepare') {
+  $t  = preg_replace('~[^a-zA-Z0-9_\-]~', '', (string)$_GET['share']);
+  $db = shares_db();
+  if (!isset($db[$t]['path'])) {
+      jsend(['ok'=>false,'error'=>'Invalid share'], 404);
+  }
+  $sharedRel = norm_rel($db[$t]['path']);
+  $shareRoot = abs_path($sharedRel);
+  ensure_inside_root($shareRoot);
+  $cwd = norm_rel((string)($_GET['cwd'] ?? ''));
+  $absList = [];
+  $pathsIn = $_GET['paths'] ?? $_POST['paths'] ?? [];
+  foreach ((array)$pathsIn as $p) {
+      $rel = norm_rel(rawurldecode($p));
+      if ($rel === '') continue;
+      $abs = realpath(
+          $shareRoot . '/' . ($cwd !== '' ? $cwd.'/' : '') . $rel
+      );
+      if ($abs === false) continue;
+      ensure_inside_share($abs, $shareRoot);
+      $absList[] = $abs;
+  }
+  if (!$absList) {
+      jsend(['ok'=>false,'error'=>'Nothing to zip'], 400);
+  }
+  $zipBase = $shareRoot . ($cwd !== '' ? '/' . $cwd : '');
+  $zipBase = realpath($zipBase);
+  if ($zipBase === false || !is_dir($zipBase)) {
+      jsend(['ok'=>false,'error'=>'Invalid ZIP base'], 400);
+  }
+  $res = zip_create_job(
+      $absList,
+      'download_' . date('Ymd_His'),
+      $zipBase
+  );
+  $db = downloads_db();
+  $db[$res['token']] = [
+      'tmp'     => $res['file'],
+      'name'    => $res['name'],
+      'created' => time(),
+  ];
+  downloads_save($db);
+  jsend([
+      'ok'    => true,
+      'token' => $res['token'],
+  ]);
+  }
+}
+
+if (isset($_GET['share']) && !isset($_GET['api'])) {
+  $t = preg_replace('~[^a-zA-Z0-9_\-]~', '', (string)$_GET['share']);
+  $db = shares_db();
+  $shareRel = norm_rel($db[$t]['path']);
+  $shareAbs = abs_path($shareRel);
+  ensure_inside_root($shareAbs);
+  $shareBytes = share_total_size($shareAbs);
+  $shareSizeFormatted = format_bytes($shareBytes);
+  if (!isset($db[$t])) {
+    http_response_code(404);
+    echo 'Share not found';
+    exit;
+  }
+  header('Content-Type: text/html; charset=utf-8');
+?>
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Shared files</title>
+<meta name="description" content="Dropzone File Explore is a simple, self-hosted file manager designed for performance, usability and security. It allows you to browse, upload, manage and share files directly in the browser – without a database and without external dependencies.">
+<link rel="icon" href="img/favicon.png">
+<link rel="apple-touch-icon" href="img/favicon.png">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body class="share-view">
+<div class="app">
+  <section>
+  </section>
+  <section class="card">
+    <div class="card-sticky">
+      <header>
+        <div style="height: 96px;" class="title"><a href="index.php"><img src="img/logo.png" alt="Dropzone File Explorer" width="295"></a></div>
+        <div class="row" style="display: block;">
+          <div id="shareSize" class="small" style="margin-left: 5px; margin-bottom: 30px;">📦 Total size: <?= htmlspecialchars($shareSizeFormatted) ?></div>
+          <button class="btn" onclick="downloadSelected()">⬇ Download selection as ZIP</button>
+        </div>
+      </header>
+    </div>
+    <div class="panel-scroll">
+      <div id="statusBar" style="padding: 10px; margin-top: 8px; margin-bottom: 8px;">
+        <div id="loadingSpinner" style="display:none;"><div class="spinner"></div></div>
+        <div id="status" class="small">Ready. Click to preview/download files or select multiple files/folders to download as ZIP.</div>
+      </div>
+      <div id="list" class="listShare"><span class="small" style="padding: 10px;">Loading…</span></div>
+    </div>
+  </section>
+  <section>
+  </section>
+</div>
+<div id="lb" style="display:none">
+  <div class="lb-backdrop"></div>
+
+  <div class="lb-modal" role="dialog" aria-modal="true">
+    <div class="lb-top">
+      <div class="lb-title" id="lbTitle" style="margin-bottom: 10px;">Preview</div>
+      <span class="tag" id="lbKind" style="margin-bottom: 10px;">—</span>
+      <div class="row">
+        <button class="btn" id="lbOpen">↗ Open</button>
+        <button class="btn ok" id="lbSave" style="display:none">💾 Save</button>
+        <button class="btn" id="lbPrev">←</button>
+        <button class="btn" id="lbNext">→</button>
+        <button class="btn danger" id="lbClose">✕</button>
+      </div>
+    </div>
+
+    <div class="lb-body" id="lbBody"></div>
+    <div class="lb-editor" id="lbEditorWrap" style="display:none">
+      <textarea class="editor" id="lbEditor" placeholder="Editor…"></textarea>
+    </div>
+  </div>
+</div>
+<div class="spacer"></div>
+<footer class="share-view"><?= htmlspecialchars(APP_TITLE) ?> V.1.1 © 2026 by Kevin Tobler - <a href='https://kevintobler.ch' target='_blank'>www.kevintobler.ch</a></footer>
+<script>
+const token = <?= json_encode($t) ?>;
+let cwd = null;
+let selected = new Set();
+
+window.IS_SHARE_VIEW = true;
+
+function fmtBytes(b) {
+  if (!b) return '—';
+  const u = ['B','KB','MB','GB','TB'];
+  let i = 0;
+  while (b >= 1024 && i < u.length - 1) {
+    b /= 1024;
+    i++;
+  }
+  return b.toFixed(1) + ' ' + u[i];
+}
+
+function fmtDate(ts) {
+  if (!ts) return '—';
+  return new Date(ts * 1000).toLocaleString('de-CH', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
+}
+
+function getPreviewUrl(it) {
+  if (window.IS_SHARE_VIEW) {
+    return `?share=${token}&api=1&action=sharePreview&path=${encodeURIComponent(it.path)}`;
+  }
+  return API('preview', 'path=' + encodeURIComponent(it.path) + '&inline=1');
+}
+
+function setEditorReadonly(on) {
+  editor.readOnly = on;
+  lbEditor.readOnly = on;
+
+  editor.classList.toggle('readonly', on);
+  lbEditor.classList.toggle('readonly', on);
+}
+
+function closeLB() {
+  const lb = document.getElementById('lb');
+  const body = document.getElementById('lbBody');
+  body.innerHTML = '';
+  body.classList.remove('pdf');
+  lb.style.display = 'none';
+}
+
+function isPreviewable(name) {
+  return /\.(png|jpe?g|gif|webp|svg|dng|heic|tiff|mp3|wav|ogg|m4a|aac|mp4|webm|mov|m4v|pdf|txt|md|json|xml|yml|yaml|ini|log|csv|tsv|php|js|ts|css|html?|py|go|java|c|cpp|h|hpp|sh|zsh|env|sql|xmp)$/i.test(name);
+}
+
+function isTextExt(name) {
+  return /\.(txt|md|json|xml|yml|yaml|ini|log|csv|tsv|php|js|ts|css|html?|py|go|java|c|cpp|h|hpp|sh|zsh|env|sql|xmp)$/i.test(name);
+}
+
+function navigatePreview(dir) {
+  if (!items.length) return;
+  currentIndex += dir;
+  if (currentIndex < 0) currentIndex = 0;
+  if (currentIndex >= items.length) currentIndex = items.length - 1;
+  openPreview();
+}
+
+function openLightboxForItem(it) {
+  currentIndex = items.findIndex(x => x.path === it.path);
+  if (currentIndex === -1) {
+    items = [it];
+    currentIndex = 0;
+  }
+  openPreview();
+}
+
+document.addEventListener('keydown', onShareKeydown);
+
+function onShareKeydown(e) {
+  if (!window.IS_SHARE_VIEW) return;
+  const lb = document.getElementById('lb');
+  if (!lb || lb.style.display !== 'block') return;
+  const ae = document.activeElement;
+  if (ae && (ae.id === 'lbEditor' || ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA')) {
+    return;
+  }
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    closeLB();
+    return;
+  }
+  if (e.key === 'ArrowLeft') navigatePreview(-1);
+  if (e.key === 'ArrowRight') navigatePreview(1);
+}
+
+async function openPreview() {
+  const it = items[currentIndex];
+  if (!it || !isPreviewable(it.name)) return;
+
+  const lb = document.getElementById('lb');
+  const body = document.getElementById('lbBody');
+  const title = document.getElementById('lbTitle');
+  const kind = document.getElementById('lbKind');
+  const editorWrap = document.getElementById('lbEditorWrap');
+  const ed = document.getElementById('lbEditor');
+
+  /* ---- RESET ---- */
+  body.innerHTML = '';
+  body.style.display = 'flex';
+  body.className = 'lb-body';
+
+  editorWrap.style.display = 'none';
+
+  ed.value = '';
+  ed.readOnly = true;
+  ed.classList.add('readonly');
+
+  title.textContent = it.name;
+  kind.textContent = it.name.split('.').pop().toUpperCase();
+
+  const url = getPreviewUrl(it);
+  
+  document.getElementById('lbOpen').onclick = () => {
+    window.open(url, '_blank');
+  };
+
+  // IMAGE
+  if (/\.(png|jpe?g|gif|webp|svg|dng|heic|tiff)$/i.test(it.name)) {
+    const img = document.createElement('img');
+    img.src = url;
+    img.style.maxWidth = '100%';
+    img.style.maxHeight = '100%';
+    body.appendChild(img);
+  }
+
+  // PDF
+  else if (/\.pdf$/i.test(it.name)) {
+    kind.textContent = 'PDF';
+    body.classList.add('pdf');
+
+    const iframe = document.createElement('iframe');
+    iframe.src = url;
+    iframe.style.width = '100%';
+    iframe.style.height = '100%';
+    iframe.style.border = '0';
+    body.appendChild(iframe);
+  }
+
+  // VIDEO / AUDIO
+  else if (/\.(mp3|wav|ogg|m4a|aac|mp4|webm|mov|m4v)$/i.test(it.name)) {
+    const media = document.createElement(
+      it.name.match(/\.(mp3|wav)$/i) ? 'audio' : 'video'
+    );
+    media.src = url;
+    media.controls = true;
+    media.autoplay = true;
+    media.style.maxWidth = '100%';
+    body.appendChild(media);
+  }
+
+  // TEXT FILES
+  else if (isTextExt(it.name)) {
+    kind.textContent = 'Text';
+    body.style.display = 'none';
+    editorWrap.style.display = 'flex';
+
+    ed.value = 'Loading…';
+    try {
+      const r = await fetch(
+        `?share=${token}&api=1&action=readText`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: it.path })
+        }
+      );
+      const j = await r.json();
+      ed.value = j.text || '';
+    } catch {
+      ed.value = 'Cannot read file.';
+    }
+  }
+
+  // Buttons
+  document.getElementById('lbPrev').onclick = () => {
+    navigatePreview(-1);
+  };
+
+  document.getElementById('lbNext').onclick = () => {
+    navigatePreview(1);
+  };
+
+  document.getElementById('lbClose').onclick = closeLB;
+  lb.style.display = 'block';
+}
+
+let items = [];
+let currentIndex = -1;
+
+async function load() {
+  if (cwd === null) return;
+  selected.clear();
+  const r = await fetch(`?share=${token}&api=1&action=shareBrowse&path=`+encodeURIComponent(cwd));
+  const j = await r.json();
+  items = j.items;
+  const box = document.getElementById('list');
+  box.innerHTML = '';
+  box.insertAdjacentHTML('beforeend', `
+    <div class="rowShareHeader">
+      <div></div>
+      <div>Name</div>
+      <div>Type</div>
+      <div>Size</div>
+      <div>Changed</div>
+    </div>
+  `);
+  if (cwd) {
+    box.insertAdjacentHTML('beforeend', `
+      <div class="rowShareBack">
+        <div></div>
+        <div>⬆️ go back…</div>
+        <div></div><div></div><div></div>
+      </div>
+    `);
+    const back = box.querySelector('.rowShareBack:last-child');
+    back.onclick = () => {
+      cwd = cwd.split('/').slice(0, -1).join('/');
+      load();
+    };
+  }
+  j.items.forEach(it => {
+    const row = document.createElement('div');
+    row.className = 'rowShare';
+    row.innerHTML = `
+      <input type="checkbox">
+      <div>${it.type === 'dir' ? '📁' : '📄'} ${it.name}</div>
+      <div>${it.type}</div>
+      <div>${it.type === 'dir' ? '—' : fmtBytes(it.size)}</div>
+      <div>${fmtDate(it.mtime)}</div>
+    `;
+    const cb = row.querySelector('input');
+    cb.onclick = e => e.stopPropagation();
+    cb.onchange = e => {
+      const rel = it.path.split('/').pop();
+      e.target.checked ? selected.add(rel) : selected.delete(rel);
+    };
+    row.onclick = () => {
+      if (it.type === 'dir') {
+        cwd = it.path;
+        load();
+        return;
+      }
+      if (!isPreviewable(it.name)) {
+        window.location =
+          `?share=${token}&api=1&action=shareDownloadFile&path=${encodeURIComponent(it.path)}`;
+        return;
+      }
+      openLightboxForItem(it);
+    };
+    box.appendChild(row);
+  });
+}
+
+function showSpinner() {
+  document.getElementById('loadingSpinner').style.display = 'flex';
+}
+
+function hideSpinner() {
+  document.getElementById('loadingSpinner').style.display = 'none';
+}
+
+async function downloadSelected() {
+  if (!selected.size) {
+    alert('Select at least one item.');
+    return;
+  }
+  const elStatus = document.getElementById('status');
+  const btn = document.querySelector('button');
+  try {
+    showSpinner();
+    elStatus.textContent = 'Creating ZIP…';
+    btn.disabled = true;
+    const p = Array.from(selected)
+      .map(p => 'paths[]=' + encodeURIComponent(p))
+      .join('&');
+    const r = await fetch(
+      `?share=${token}&api=1&action=shareDownloadPrepare`
+      + `&cwd=${encodeURIComponent(cwd)}`
+      + `&${p}`
+    );
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error || 'Failed to prepare ZIP');
+    window.location =
+      `?share=${token}&api=1&action=shareDownloadPrepared&token=${j.token}`;
+    elStatus.textContent = 'Download starting…';
+  } catch (err) {
+    elStatus.textContent = 'Error creating ZIP.';
+    alert(err.message || err);
+  } finally {
+    setTimeout(() => {
+      hideSpinner();
+      elStatus.textContent = 'Ready. Click to preview/download files or select multiple files/folders to download as ZIP.';
+      btn.disabled = false;
+    }, 1200);
+  }
+}
+(async () => {
+  cwd = '';
+  await load();
+})();
+</script>
+</body>
+</html>
+<?php
+  exit;
+}
+
+// --------------------  ROOT STATS --------------------
+if ($action === 'rootStats') {
+  $bytes = get_root_total_size();
+  jsend([
+    'ok' => true,
+    'bytes' => $bytes,
+    'formatted' => format_bytes($bytes),
+  ]);
+}
+
+// -------------------- ROOT FILESIZE --------------------
+function dir_total_size(string $rel = ''): int {
+    $abs = abs_path($rel);
+    if (!is_dir($abs)) {
+        return 0;
+    }
+    if ($rel === '' && !auth_is_admin()) {
+      return 0;
+    }
+    if (!auth_is_admin()) {
+      ensure_inside_allowed_roots($abs);
+    }
+    $total = 0;
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator(
+            $abs,
+            FilesystemIterator::SKIP_DOTS
+        )
+    );
+    foreach ($it as $file) {
+        if ($file->isDir()) continue;
+        if (!$file->isReadable()) continue;
+        if (is_excluded_file($file->getFilename())) continue;
+        $total += $file->getSize();
+    }
+    return $total;
+}
+
+function format_bytes(int $bytes): string {
+    $units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    $i = 0;
+    while ($bytes >= 1024 && $i < count($units) - 1) {
+        $bytes /= 1024;
+        $i++;
+    }
+    return sprintf('%.1f %s', $bytes, $units[$i]);
+}
+
+function get_root_total_size(): int {
+  if (auth_is_admin()) {
+    return dir_total_size('');
+  }
+  $total = 0;
+  foreach (user_allowed_roots() as $relRoot) {
+    $total += dir_total_size($relRoot);
+  }
+  return $total;
+}
+
+// -------------------- API ROUTES --------------------
+$isApi =
+  !isset($_GET['share']) &&
+  (isset($_GET['api']) || isset($_POST['api']) || ($action !== ''));
+if ($isApi) {
+  tmp_gc(3600);
+  $action = (string)($_GET['action'] ?? $_POST['action'] ?? '');
+  $body = read_json_body();
 
 // --- WHOAMI (current session user) ---
 if ($action === 'whoami') {
@@ -387,6 +1353,8 @@ if ($action === 'userList') {
     $out[] = [
       'user' => (string)$u,
       'created' => (int)($info['created'] ?? 0),
+      'role'    => (string)($info['role'] ?? 'user'),
+      'folders' => (array)($info['folders'] ?? []),
     ];
   }
   usort($out, fn($a,$b)=>strcmp($a['user'],$b['user']));
@@ -413,7 +1381,7 @@ if ($action === 'userList') {
       'created' => time(),
       'role' => 'user',
     ];
-    auth_save($db);
+    auth_save_safe($db);
     jsend(['ok'=>true]);
   }
 
@@ -426,15 +1394,18 @@ if ($action === 'userList') {
     if ($user === '') jsend(['ok'=>false,'error'=>'Missing user'], 400);
     $db = auth_db();
     $users = (array)($db['users'] ?? []);
-    if (!isset($users[$user])) jsend(['ok'=>true]);
-    if (count($users) <= 1) jsend(['ok'=>false,'error'=>'You cannot delete the last user.'], 400);
+    if (!isset($users[$user])) {
+      jsend(['ok'=>true]);
+    }
+    if (($users[$user]['role'] ?? '') === 'admin') {
+      jsend(['ok'=>false,'error'=>'Admin user cannot be deleted.'], 400);
+    }
+    if (count($users) <= 1) {
+      jsend(['ok'=>false,'error'=>'You cannot delete the last user.'], 400);
+    }
     unset($users[$user]);
     $db['users'] = $users;
-    auth_save($db);
-    if (!empty($_SESSION['auth_user']) && $_SESSION['auth_user'] === $user) {
-      $_SESSION = [];
-      session_destroy();
-    }
+    auth_save_safe($db);
     jsend(['ok'=>true]);
   }
 
@@ -456,8 +1427,72 @@ if ($action === 'userPw') {
   if (!isset($db['users']) || !is_array($db['users'])) $db['users'] = [];
   if (!isset($db['users'][$user])) jsend(['ok'=>false,'error'=>'User not found.'], 404);
   $db['users'][$user]['hash'] = password_hash($pass, PASSWORD_DEFAULT);
-  auth_save($db);
+  auth_save_safe($db);
   jsend(['ok'=>true]);
+}
+
+// --- USER UPDATE ---
+if ($action === 'userUpdate') {
+  if (!auth_is_admin()) jsend(['ok'=>false,'error'=>'Forbidden'], 403);
+  $user = (string)($body['user'] ?? '');
+  $folders = (array)($body['folders'] ?? []);
+  $clean = [];
+  foreach ($folders as $path => $mode) {
+    $path = trim(norm_rel($path), '/');
+    if ($path === '' || str_contains($path, '..')) continue;
+    if (!in_array($mode, ['read','write'], true)) continue;
+    if (!is_dir(abs_path($path))) continue;
+    $clean[$path] = $mode;
+  }
+  $db = auth_db();
+  $db['users'][$user]['folders'] = $clean;
+  auth_save_safe($db);
+  jsend(['ok'=>true]);
+}
+
+// --- USER FOLDER SET ---
+if ($action === 'userFolderSet') {
+  if (!auth_is_admin()) jsend(['ok'=>false,'error'=>'Forbidden'], 403);
+  $user = (string)$body['user'];
+  $path = trim(norm_rel((string)$body['path']), '/');
+  $mode = (string)$body['mode'];
+  if ($path === '' || str_contains($path, '..')) {
+    jsend(['ok'=>false,'error'=>'Invalid path'], 400);
+  }
+  if (!in_array($mode, ['read','write'], true)) {
+    jsend(['ok'=>false,'error'=>'Invalid mode'], 400);
+  }
+if (!is_dir(abs_path($path))) {
+    jsend(['ok'=>false,'error'=>'Folder does not exist'], 400);
+  }
+  $db = auth_db();
+  $db['users'][$user]['folders'][$path] = $mode;
+  auth_save_safe($db);
+  jsend(['ok'=>true]);
+}
+
+// --- USER FOLDER REMOVE ---
+if ($action === 'userFolderRemove') {
+  if (!auth_is_admin()) jsend(['ok'=>false,'error'=>'Forbidden'], 403);
+  $user = (string)$body['user'];
+  $path = trim(norm_rel((string)$body['path']), '/');
+  $db = auth_db();
+  unset($db['users'][$user]['folders'][$path]);
+  auth_save_safe($db);
+  jsend(['ok'=>true]);
+}
+
+// --- ACL CLEANUP ---
+if ($action === 'aclCleanup') {
+  if (!auth_is_admin()) {
+    jsend(['ok'=>false,'error'=>'Forbidden'], 403);
+  }
+  $removed = cleanup_dead_user_folders();
+  jsend([
+    'ok' => true,
+    'usersAffected' => count($removed),
+    'removed' => $removed,
+  ]);
 }
 
 if (session_status() === PHP_SESSION_ACTIVE) {
@@ -474,30 +1509,60 @@ if ($action === 'list') {
 
 // --- TREE ROOT / CHILDREN ---
 if ($action === 'treeRoot') {
-  $nodes = build_tree('');
+  if (auth_is_admin()) {
+    jsend(['ok'=>true,'nodes'=>build_tree('')]);
+  }
+  $nodes = [];
+  foreach (user_allowed_roots() as $rel) {
+    if ($rel === '') continue;
+    $nodes[] = [
+      'name' => basename($rel),
+      'path' => $rel,
+      'hasChildren' => has_dir_children($rel),
+    ];
+  }
   jsend(['ok'=>true,'nodes'=>$nodes]);
 }
 
 if ($action === 'treeChildren') {
   $rel = norm_rel((string)($_GET['path'] ?? $body['path'] ?? ''));
+  if ($rel === '' && !auth_is_admin()) {
+    jsend(['ok'=>true,'path'=>$rel,'nodes'=>[]]);
+  }
   $nodes = build_tree($rel);
   jsend(['ok'=>true,'path'=>$rel,'nodes'=>$nodes]);
+}
+
+if ($action === 'folderList') {
+  if (!auth_is_admin()) jsend(['ok'=>false,'error'=>'Forbidden'], 403);
+  $nodes = build_tree('');
+  jsend(['ok'=>true,'nodes'=>$nodes]);
 }
 
 // --- MKDIR ---
 if ($action === 'mkdir') {
   $parent = norm_rel((string)($body['parent'] ?? ''));
-  $name = (string)($body['name'] ?? 'New Folder');
-  $name = trim($name);
-  if ($name === '' || strpbrk($name, "\\/:*?\"<>|") !== false) jsend(['ok'=>false,'error'=>'Invalid folder name'], 400);
-
+  if ($parent === '' && !auth_is_admin()) {
+    jsend(['ok'=>false,'error'=>'Invalid parent'], 403);
+  }
+  ensure_write_allowed($parent);
+  $name = trim((string)($body['name'] ?? 'New Folder'));
+  if ($name === '' || strpbrk($name, "\\/:*?\"<>|") !== false) {
+    jsend(['ok'=>false,'error'=>'Invalid folder name'], 400);
+  }
   $absParent = abs_path($parent);
-  ensure_inside_root($absParent);
-  if (!is_dir($absParent)) jsend(['ok'=>false,'error'=>'Parent not a directory'], 400);
-
+  if (!is_dir($absParent)) {
+    jsend(['ok'=>false,'error'=>'Parent not found'], 400);
+  }
+  ensure_inside_allowed_roots($absParent);
   $abs = $absParent . DIRECTORY_SEPARATOR . $name;
-  if (file_exists($abs)) jsend(['ok'=>false,'error'=>'Already exists'], 400);
-  if (!@mkdir($abs, 0775, true)) jsend(['ok'=>false,'error'=>'Cannot create folder'], 500);
+  ensure_target_inside_allowed_roots($abs);
+  if (file_exists($abs)) {
+    jsend(['ok'=>false,'error'=>'Already exists'], 400);
+  }
+  if (!@mkdir($abs, 0775, true)) {
+    jsend(['ok'=>false,'error'=>'Cannot create folder'], 500);
+  }
   jsend(['ok'=>true]);
 }
 
@@ -507,11 +1572,12 @@ if ($action === 'delete') {
   if (!is_array($paths) || !$paths) {
     jsend(['ok'=>false,'error'=>'No paths'], 400);
   }
-
   foreach ($paths as $rel) {
     $rel = norm_rel((string)$rel);
+    $parent = norm_rel(dirname($rel));
+    ensure_write_allowed($parent);
     $abs = abs_path($rel);
-    ensure_inside_root($abs);
+    ensure_inside_allowed_roots($abs);
     if (!file_exists($abs)) continue;
     if (is_dir($abs)) {
       if (!rrmdir($abs)) {
@@ -521,6 +1587,7 @@ if ($action === 'delete') {
           'message' => 'Folder could not be deleted (name too long?)'
         ], 400);
       }
+      revoke_acl_for_deleted_path($rel);
     } else {
       if (!@unlink($abs)) {
         jsend([
@@ -537,13 +1604,14 @@ if ($action === 'delete') {
 // --- RENAME ---
 if ($action === 'rename') {
   $rel = norm_rel((string)($body['path'] ?? ''));
+  $parent = norm_rel(dirname($rel));
+  ensure_write_allowed($parent);
   $newName = trim((string)($body['newName'] ?? ''));
   if ($newName === '' || strpbrk($newName, "\\/:*?\"<>|") !== false) jsend(['ok'=>false,'error'=>'Invalid name'], 400);
   $abs = abs_path($rel);
-  ensure_inside_root($abs);
+  ensure_inside_allowed_roots($abs);
   if (!file_exists($abs)) jsend(['ok'=>false,'error'=>'Not found'], 404);
   $dstAbs = dirname($abs) . DIRECTORY_SEPARATOR . $newName;
-  ensure_inside_root($dstAbs);
   if (file_exists($dstAbs)) jsend(['ok'=>false,'error'=>'Destination exists'], 400);
   if (!@rename($abs, $dstAbs)) jsend(['ok'=>false,'error'=>'Rename failed'], 500);
   jsend(['ok'=>true]);
@@ -554,16 +1622,19 @@ if ($action === 'move') {
   $paths = $body['paths'] ?? [];
   $dest = norm_rel((string)($body['dest'] ?? ''));
   if (!is_array($paths) || !$paths) jsend(['ok'=>false,'error'=>'No paths'], 400);
+  ensure_write_allowed($dest);
   $destAbs = abs_path($dest);
-  ensure_inside_root($destAbs);
+  ensure_inside_allowed_roots($destAbs);
   if (!is_dir($destAbs)) jsend(['ok'=>false,'error'=>'Destination is not a folder'], 400);
   foreach ($paths as $rel) {
     $rel = norm_rel((string)$rel);
     $abs = abs_path($rel);
-    ensure_inside_root($abs);
+    ensure_inside_allowed_roots($abs);
     if (!file_exists($abs)) continue;
+    if ($dest === $rel) {
+      jsend(['ok'=>false,'error'=>'Source and destination are the same'], 400);
+    }
     $dst = $destAbs . DIRECTORY_SEPARATOR . basename($abs);
-    ensure_inside_root($dst);
     if (is_dir($abs)) {
       $realA = realpath($abs);
       $realD = realpath($destAbs);
@@ -581,16 +1652,26 @@ if ($action === 'copy') {
   $paths = $body['paths'] ?? [];
   $dest = norm_rel((string)($body['dest'] ?? ''));
   if (!is_array($paths) || !$paths) jsend(['ok'=>false,'error'=>'No paths'], 400);
+  ensure_write_allowed($dest);
   $destAbs = abs_path($dest);
-  ensure_inside_root($destAbs);
+  ensure_inside_allowed_roots($destAbs);
   if (!is_dir($destAbs)) jsend(['ok'=>false,'error'=>'Destination is not a folder'], 400);
   foreach ($paths as $rel) {
     $rel = norm_rel((string)$rel);
     $abs = abs_path($rel);
-    ensure_inside_root($abs);
+    ensure_inside_allowed_roots($abs);
     if (!file_exists($abs)) continue;
+    if ($dest === $rel) {
+      jsend(['ok'=>false,'error'=>'Source and destination are the same'], 400);
+    }
+    if (is_dir($abs)) {
+      $realA = realpath($abs);
+      $realD = realpath($destAbs);
+      if ($realA && $realD && strpos($realD . DIRECTORY_SEPARATOR, $realA . DIRECTORY_SEPARATOR) === 0) {
+        jsend(['ok'=>false,'error'=>'Cannot copy folder into itself'], 400);
+      }
+    }
     $dst = $destAbs . DIRECTORY_SEPARATOR . basename($abs);
-    ensure_inside_root($dst);
     if (file_exists($dst)) {
       $dstName = unique_name($destAbs, basename($abs));
       $dst = $destAbs . DIRECTORY_SEPARATOR . $dstName;
@@ -600,246 +1681,301 @@ if ($action === 'copy') {
   jsend(['ok'=>true]);
 }
 
-// --- ZIP CREATE ---
-if ($action === 'zipCreate') {
-  set_time_limit(0);
-  $paths = $body['paths'] ?? [];
-  if (!is_array($paths) || !$paths) {
-    jsend(['ok'=>false,'error'=>'No paths'], 400);
-  }
-
-  $destDir = norm_rel((string)($body['destDir'] ?? ''));
-  $destAbs = abs_path($destDir);
-  ensure_inside_root($destAbs);
-  if (!is_dir($destAbs)) {
-    jsend(['ok'=>false,'error'=>'Destination is not a folder'], 400);
-  }
-
-  // --- ZIP NAME ---
-  $zipName = trim((string)($body['name'] ?? 'archive'));
-  $zipName = preg_replace('~[\\\\/:*?"<>|]+~', '_', $zipName);
-  if ($zipName === '') $zipName = 'archive';
-  if (!preg_match('~\.zip$~i', $zipName)) $zipName .= '.zip';
-
-  // --- POLICY ---
-  $policy = (string)($body['policy'] ?? 'rename');
-  if (!in_array($policy, ['overwrite','rename','ask'], true)) {
-    $policy = 'rename';
-  }
-  $finalName = $zipName;
-  $finalAbs  = $destAbs . DIRECTORY_SEPARATOR . $finalName;
-  if (file_exists($finalAbs)) {
-    if ($policy === 'overwrite') {
-      // ok
-    } elseif ($policy === 'rename') {
-      $finalName = unique_name($destAbs, $finalName);
-      $finalAbs  = $destAbs . DIRECTORY_SEPARATOR . $finalName;
-    } else {
-      jsend(['ok'=>false,'needsChoice'=>true,'error'=>'ZIP exists'], 409);
+// --- PREVIEW / DIRECT DOWNLOAD ---
+if ($action === 'preview') {
+    $rel = norm_rel((string)($_GET['path'] ?? ''));
+    if ($rel === '') {
+        http_response_code(400);
+        exit('Invalid path');
     }
-  }
+    $abs = realpath(abs_path($rel));
+    if (!$abs || !is_file($abs)) {
+        http_response_code(404);
+        exit('File not found');
+    }
+    ensure_inside_allowed_roots($abs);
+    $inline = isset($_GET['inline']) && $_GET['inline'] == '1';
+    $mime = mime_content_type($abs) ?: 'application/octet-stream';
+    while (ob_get_level()) ob_end_clean();
+    header('Content-Type: ' . $mime);
+    header('Content-Length: ' . filesize($abs));
+    header('X-Content-Type-Options: nosniff');
+    if (!$inline) {
+        header('Content-Disposition: attachment; filename="' . rawurlencode(basename($abs)) . '"');
+    }
+    readfile($abs);
+    exit;
+}
 
-  // --- BUILD ABS PATH LIST ---
+// --- DOWNLOAD ---
+if ($action === 'download' && !isset($_GET['dl'])) {
+  if (!auth_is_logged_in()) {
+    jsend(['ok'=>false,'error'=>'Auth required'], 401);
+  }
+  $cwd   = norm_rel((string)($body['cwd'] ?? ''));
+  $paths = (array)($body['paths'] ?? []);
+  if (!$paths) {
+    jsend(['ok'=>false,'error'=>'Nothing selected'], 400);
+  }
+  $zipBase = abs_path($cwd);
+  if (!is_dir($zipBase)) {
+    jsend(['ok'=>false,'error'=>'Invalid directory'], 400);
+  }
+  ensure_inside_allowed_roots($zipBase);
   $absList = [];
-  foreach ($paths as $rel) {
-    $rel = norm_rel((string)$rel);
+  foreach ($paths as $p) {
+    $rel = norm_rel((string)$p);
     if ($rel === '') continue;
-    $abs = abs_path($rel);
-    ensure_inside_root($abs);
-    if (file_exists($abs)) {
-      $absList[] = $abs;
+    $abs = realpath($zipBase . '/' . $rel);
+    if ($abs === false) {
+      $abs = realpath(abs_path($rel));
     }
+    if ($abs === false) continue;
+    ensure_inside_allowed_roots($abs);
+    $absList[] = $abs;
   }
   if (!$absList) {
     jsend(['ok'=>false,'error'=>'Nothing to zip'], 400);
   }
+  $label = $cwd !== '' ? basename($cwd) : 'download';
+  $res = zip_create_job(
+    $absList,
+    $label . '_' . date('Ymd_His'),
+    $zipBase
+  );
+  $db = downloads_db();
+  $db[$res['token']] = [
+    'tmp'     => $res['file'],
+    'name'    => $res['name'],
+    'created' => time(),
+  ];
+  downloads_save($db);
+  jsend([
+    'ok'    => true,
+    'token' => $res['token'],
+  ]);
+}
 
-  // --- CLI ZIP ---
+// --- ZIP CREATE ---
+if ($action === 'zipCreate') {
+  $policy = (string)($body['policy'] ?? 'ask');
+  if (!in_array($policy, ['ask','overwrite','rename'], true)) {
+    $policy = 'ask';
+  }
+  if (!auth_is_logged_in()) {
+    jsend(['ok'=>false,'error'=>'Auth required'], 401);
+  }
+  $paths = (array)($body['paths'] ?? []);
+  if (!$paths) {
+    jsend(['ok'=>false,'error'=>'Nothing selected'], 400);
+  }
+  $absList = [];
+  foreach ($paths as $p) {
+    $rel = norm_rel((string)$p);
+    if ($rel === '') continue;
+    $abs = realpath(abs_path($rel));
+    if ($abs === false) continue;
+    ensure_inside_allowed_roots($abs);
+    $absList[] = $abs;
+  }
+  if (!$absList) {
+    jsend(['ok'=>false,'error'=>'Nothing to zip'], 400);
+  }
+  $firstAbs = $absList[0];
+  $zipBase  = dirname($firstAbs);
+  if (!is_dir($zipBase)) {
+    jsend(['ok'=>false,'error'=>'Invalid ZIP base'], 400);
+  }
+  ensure_inside_allowed_roots($zipBase);
+  if (!empty($body['name'])) {
+    $name = trim((string)$body['name']);
+  } else {
+    if (count($absList) === 1) {
+      $name = basename($firstAbs);
+    } else {
+      $name = 'selection';
+    }
+  }
+  $name = preg_replace('~[^a-zA-Z0-9._() -]~', '_', $name);
+  if (!str_ends_with(strtolower($name), '.zip')) {
+    $name .= '.zip';
+  }
+  $label = preg_replace('~\.zip$~i', '', $name);
   try {
-    zip_cli($finalAbs, $absList);
+    $res = zip_create_job(
+      $absList,
+      $label,
+      $zipBase
+    );
   } catch (Throwable $e) {
-    @unlink($finalAbs);
-    jsend([
-      'ok'=>false,
-      'error'=>'ZIP creation failed',
-      'detail'=>$e->getMessage()
-    ], 500);
+    jsend(['ok'=>false,'error'=>'ZIP failed','detail'=>$e->getMessage()], 500);
   }
-  if (!is_file($finalAbs) || filesize($finalAbs) === 0) {
-    @unlink($finalAbs);
-    jsend(['ok'=>false,'error'=>'Zip is empty or missing'], 500);
+  $finalPath = $zipBase . DIRECTORY_SEPARATOR . $res['name'];
+  if (file_exists($finalPath)) {
+    if ($policy === 'ask') {
+      @unlink($res['file']);
+      jsend([
+        'ok' => false,
+        'needsChoice' => true,
+        'error' => 'ZIP already exists',
+        'path' => norm_rel(substr($finalPath, strlen(realpath(ROOT_DIR)) + 1))
+      ], 409);
+    }
+    if ($policy === 'rename') {
+      $newName   = unique_name($zipBase, basename($finalPath));
+      $finalPath = $zipBase . DIRECTORY_SEPARATOR . $newName;
+    }
+    if ($policy === 'overwrite') {
+      @unlink($finalPath);
+    }
   }
-  $finalRel = norm_rel(($destDir !== '' ? $destDir.'/' : '') . $finalName);
-  jsend(['ok'=>true,'path'=>$finalRel]);
+  if (!@rename($res['file'], $finalPath)) {
+    @unlink($res['file']);
+    jsend(['ok'=>false,'error'=>'Cannot move ZIP'], 500);
+  }
+  jsend([
+    'ok'   => true,
+    'path' => norm_rel(substr($finalPath, strlen(realpath(ROOT_DIR)) + 1))
+  ]);
 }
 
 // --- UNZIP ---
 if ($action === 'unzip') {
-  if (!class_exists('ZipArchive')) jsend(['ok'=>false,'error'=>'ZipArchive missing'], 500);
-  $rel  = norm_rel((string)($body['path'] ?? ''));
-  $dest = norm_rel((string)($body['dest'] ?? dirname($rel)));
+  $zipRel = norm_rel((string)($body['path'] ?? ''));
+  $dest   = norm_rel((string)($body['dest'] ?? dirname($zipRel)));
   $policy = (string)($body['policy'] ?? 'ask');
-  if (!in_array($policy, ['ask','overwrite','rename'], true)) $policy = 'ask';
-  $abs     = abs_path($rel);
+  if (!in_array($policy, ['ask','overwrite','rename'], true)) {
+    $policy = 'ask';
+  }
+  $zipAbs  = abs_path($zipRel);
   $destAbs = abs_path($dest);
-  ensure_inside_root($abs);
-  ensure_inside_root($destAbs);
-  if (!is_file($abs)) jsend(['ok'=>false,'error'=>'Not a file'], 400);
-  if (!is_dir($destAbs)) {
-    if (!@mkdir($destAbs, 0775, true)) jsend(['ok'=>false,'error'=>'Cannot create destination folder'], 500);
+  ensure_inside_root($zipAbs);
+  if (!is_file($zipAbs)) {
+    jsend(['ok'=>false,'error'=>'Not a file'], 400);
   }
-  $zip = new ZipArchive();
-  if ($zip->open($abs) !== true) jsend(['ok'=>false,'error'=>'Cannot open zip'], 400);
-
-  // -------- Detect single top-level folder --------
-  $top = null;
-  $singleTop = true;
-  for ($i=0; $i<$zip->numFiles; $i++) {
-    $st = $zip->statIndex($i);
-    $name = (string)($st['name'] ?? '');
-    if ($name === '') continue;
-    if (str_starts_with($name, '__MACOSX/')) continue;
-    $clean = norm_rel($name);
-    if ($clean === '') continue;
-    $parts = explode('/', $clean);
-    $first = $parts[0] ?? '';
-    if ($first === '') continue;
-    if (count($parts) === 1) {
-  if (str_ends_with($name, '/')) {
-    if ($top === null) $top = $first;
-    else if ($top !== $first) { $singleTop = false; break; }
-    continue;
+  ensure_write_allowed($dest);
+  if (!is_dir($destAbs) && !@mkdir($destAbs, 0775, true)) {
+    jsend(['ok'=>false,'error'=>'Cannot create destination'], 500);
   }
-  $singleTop = false;
-  break;
-}
-
-  if ($top === null) $top = $first;
-  else if ($top !== $first) {
-    $singleTop = false; break;
+  ensure_inside_allowed_roots($destAbs);
+  $tmpBase = $destAbs . '/._unzip_tmp_' . bin2hex(random_bytes(6));
+  if (!mkdir($tmpBase, 0775, true)) {
+    jsend(['ok'=>false,'error'=>'Cannot create temp folder'], 500);
   }
-}
-
-  // -------- Decide extraction base --------
-  $stripPrefix = '';
-  $baseDirAbs = $destAbs;
-  if ($singleTop && $top !== null) {
-    $stripPrefix = $top . '/';
-    $folderName = $top;
-    $folderAbs  = $destAbs . DIRECTORY_SEPARATOR . $folderName;
-    if (file_exists($folderAbs)) {
+  $cmdList = 'unzip -Z1 ' . escapeshellarg($zipAbs) . ' 2>&1';
+  exec($cmdList, $entries, $rc);
+  if ($rc !== 0 || !$entries) {
+    rrmdir($tmpBase);
+    jsend(['ok'=>false,'error'=>'ZIP listing failed'], 400);
+  }
+  foreach ($entries as $name) {
+    $name = trim(str_replace('\\','/',$name));
+    if (
+      $name === '' ||
+      $name[0] === '/' ||
+      str_contains($name, '../') ||
+      preg_match('~^[a-zA-Z]:/~', $name)
+    ) {
+      rrmdir($tmpBase);
+      jsend(['ok'=>false,'error'=>'Unsafe ZIP paths detected'], 400);
+    }
+  }
+  $cmd = 'unzip -o ' . escapeshellarg($zipAbs)
+       . ' -d ' . escapeshellarg($tmpBase) . ' 2>&1';
+  exec($cmd, $out, $rc);
+  if ($rc !== 0) {
+    rrmdir($tmpBase);
+    jsend(['ok'=>false,'error'=>'Unzip failed','detail'=>implode("\n",$out)], 500);
+  }
+  $topItems = [];
+  foreach (scandir($tmpBase) as $i) {
+    if ($i === '.' || $i === '..') continue;
+    if (is_excluded_file($i)) continue;
+    $topItems[] = $i;
+  }
+  if (!$topItems) {
+    rrmdir($tmpBase);
+    jsend(['ok'=>true,'empty'=>true]);
+  }
+  foreach ($topItems as $item) {
+    $src = $tmpBase . '/' . $item;
+    $dst = $destAbs . '/' . $item;
+    if (file_exists($dst)) {
       if ($policy === 'ask') {
-        $zip->close();
+        rrmdir($tmpBase);
         jsend([
-          'ok' => false,
-          'needsChoice' => true,
-          'error' => 'Folder exists',
-          'path' => norm_rel(($dest !== '' ? $dest.'/' : '') . $folderName),
+          'ok'=>false,
+          'needsChoice'=>true,
+          'path'=>norm_rel($dest.'/'.$item)
         ], 409);
       }
       if ($policy === 'rename') {
-        $folderName = unique_name($destAbs, $folderName);
-        $folderAbs  = $destAbs . DIRECTORY_SEPARATOR . $folderName;
+        $dst = $destAbs . '/' . unique_name($destAbs, $item);
+      }
+      if ($policy === 'overwrite') {
+        rrmdir($dst);
       }
     }
-    if (!is_dir($folderAbs)) {
-      if (!@mkdir($folderAbs, 0775, true)) {
-        $zip->close();
-        jsend(['ok'=>false,'error'=>'Cannot create target folder'], 500);
-      }
+    if (!@rename($src, $dst)) {
+      rrmdir($tmpBase);
+      jsend(['ok'=>false,'error'=>'Move failed (rename error)'], 500);
     }
-    $baseDirAbs = $folderAbs;
-    ensure_inside_root($baseDirAbs);
   }
-
-  // -------- Safe extraction --------
-  for ($i=0; $i<$zip->numFiles; $i++) {
-    $st = $zip->statIndex($i);
-    $name = (string)($st['name'] ?? '');
-    if ($name === '') continue;
-    if (str_starts_with($name, '__MACOSX/')) continue;
-    $clean = norm_rel($name);
-    if ($clean === '') continue;
-    $isDir = str_ends_with($name, '/');
-    if ($isDir) continue;
-    if ($stripPrefix !== '' && str_starts_with($clean, $stripPrefix)) {
-      $clean = substr($clean, strlen($stripPrefix));
-      $clean = norm_rel($clean);
-      if ($clean === '') continue;
-    }
-    $target = $baseDirAbs . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $clean);
-    ensure_inside_root($target);
-    if (file_exists($target)) {
-      if ($policy === 'ask') {
-        $zip->close();
-        jsend([
-          'ok' => false,
-          'needsChoice' => true,
-          'error' => 'File exists',
-          'path' => norm_rel(($dest !== '' ? $dest.'/' : '') . ($singleTop && $top ? ($folderName.'/'.$clean) : $clean)),
-        ], 409);
-      }
-      if ($policy === 'rename') {
-        $dirAbs = dirname($target);
-        $base   = basename($target);
-        $newBase = unique_name($dirAbs, $base);
-        $target = $dirAbs . DIRECTORY_SEPARATOR . $newBase;
-      }
-    }
-    @mkdir(dirname($target), 0775, true);
-    $in = $zip->getStream($st['name']);
-    if (!$in) { $zip->close(); jsend(['ok'=>false,'error'=>'Cannot read entry','detail'=>$st['name']], 500); }
-    $out = @fopen($target, 'wb');
-    if (!$out) { fclose($in); $zip->close(); jsend(['ok'=>false,'error'=>'Cannot write file','detail'=>$clean], 500); }
-    while (!feof($in)) {
-      $buf = fread($in, 1024 * 1024);
-      if ($buf === false) break;
-      fwrite($out, $buf);
-    }
-    fclose($out);
-    fclose($in);
-  }
-  $zip->close();
-  jsend([
-    'ok'=>true,
-    'singleTop'=>($singleTop && $top !== null),
-    'folder'=>($singleTop && $top !== null) ? $folderName : null
-  ]);
-}
-
-// --- PREVIEW ---
-if ($action === 'preview') {
-  $rel = norm_rel((string)($_GET['path'] ?? ''));
-  $abs = abs_path($rel);
-  ensure_inside_root($abs);
-  if (!is_file($abs)) { http_response_code(404); exit; }
-  $mime = detect_mime($abs);
-  $inline = (bool)($_GET['inline'] ?? true);
-  header('Content-Type: '.$mime);
-  header('Content-Length: '.filesize($abs));
-  header('Content-Disposition: '.($inline ? 'inline' : 'attachment').'; filename="'.rawurlencode(basename($abs)).'"');
-  readfile($abs);
-  exit;
+  rmdir($tmpBase);
+  jsend(['ok'=>true]);
 }
 
 // --- READ TEXT ---
 if ($action === 'readText') {
-  $rel = norm_rel((string)($body['path'] ?? ''));
-  $abs = abs_path($rel);
-  ensure_inside_root($abs);
-  if (!is_file($abs)) jsend(['ok'=>false,'error'=>'Not found'], 404);
-  $size = filesize($abs);
-  if ($size > SAFE_TEXT_MAX) jsend(['ok'=>false,'error'=>'File too large for editor'], 400);
+  if (defined('IS_PUBLIC_SHARE') && IS_PUBLIC_SHARE) {
+    if (!isset($_GET['share'])) {
+      jsend(['ok'=>false,'error'=>'Invalid share'], 403);
+    }
+    $t  = preg_replace('~[^a-zA-Z0-9_\-]~', '', (string)$_GET['share']);
+    $db = shares_db();
+    if (!isset($db[$t]['path'])) {
+      jsend(['ok'=>false,'error'=>'Invalid share'], 404);
+    }
+    $shareRootRel = norm_rel($db[$t]['path']);
+    $shareRootAbs = abs_path($shareRootRel);
+    ensure_inside_root($shareRootAbs);
+    $rel = norm_rel((string)($body['path'] ?? ''));
+    if (is_file($shareRootAbs)) {
+      $abs = $shareRootAbs;
+    } else {
+      if ($rel === '') {
+        jsend(['ok'=>false,'error'=>'Missing path'], 400);
+      }
+      $abs = realpath($shareRootAbs . '/' . $rel);
+    }
+    if (!$abs || !is_file($abs)) {
+      jsend(['ok'=>false,'error'=>'Not found'], 404);
+    }
+    ensure_inside_share($abs, $shareRootAbs);
+  }
+  else {
+    $rel = norm_rel((string)($body['path'] ?? ''));
+    $abs = abs_path($rel);
+    ensure_inside_allowed_roots($abs);
+  }
+  if (!is_file($abs)) {
+    jsend(['ok'=>false,'error'=>'Not found'], 404);
+  }
+  if (filesize($abs) > SAFE_TEXT_MAX) {
+    jsend(['ok'=>false,'error'=>'File too large'], 400);
+  }
   $txt = (string)@file_get_contents($abs);
   jsend(['ok'=>true,'text'=>$txt]);
 }
 
 // --- SAVE TEXT (editor) ---
 if ($action === 'saveText') {
+  $parent = norm_rel((string)($body['parent'] ?? ''));
+  ensure_write_allowed($parent);
   $rel = norm_rel((string)($body['path'] ?? ''));
   $text = (string)($body['text'] ?? '');
   $abs = abs_path($rel);
-  ensure_inside_root($abs);
+  ensure_inside_allowed_roots($abs);
   if (!is_file($abs)) jsend(['ok'=>false,'error'=>'Not found'], 404);
   if (strlen($text) > SAFE_TEXT_MAX) jsend(['ok'=>false,'error'=>'Too large'], 400);
   if (@file_put_contents($abs, $text, LOCK_EX) === false) jsend(['ok'=>false,'error'=>'Save failed'], 500);
@@ -853,11 +1989,15 @@ if ($action === 'shareCreate') {
   if (count($paths) !== 1) jsend(['ok'=>false,'error'=>'Select exactly 1 item for share'], 400);
   $rel = norm_rel((string)$paths[0]);
   $abs = abs_path($rel);
-  ensure_inside_root($abs);
+  ensure_inside_allowed_roots($abs);
   if (!file_exists($abs)) jsend(['ok'=>false,'error'=>'Not found'], 404);
   $db = shares_db();
   $t = token();
-  $db[$t] = ['path'=>$rel, 'created'=>time()];
+  $db[$t] = [
+    'path'    => $rel,
+    'created' => time(),
+    'owner'   => AUTH_ENABLE ? ($_SESSION['auth_user'] ?? null) : null,
+  ];
   shares_save($db);
   $scheme =
   (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
@@ -877,7 +2017,14 @@ if ($action === 'shareCreate') {
 if ($action === 'shareRevoke') {
   $t = preg_replace('~[^a-zA-Z0-9_\-]~', '', (string)($body['token'] ?? ''));
   $db = shares_db();
-  if (isset($db[$t])) { unset($db[$t]); shares_save($db); }
+  if (!isset($db[$t])) jsend(['ok'=>true]);
+  $entry = $db[$t];
+  $me = AUTH_ENABLE ? ($_SESSION['auth_user'] ?? null) : null;
+  if (AUTH_ENABLE && (($entry['owner'] ?? null) !== $me)) {
+    jsend(['ok'=>false,'error'=>'Forbidden'], 403);
+  }
+  unset($db[$t]);
+  shares_save($db);
   jsend(['ok'=>true]);
 }
 
@@ -895,7 +2042,14 @@ if ($action === 'shareList') {
     ? rtrim(BASE_URL, '/')
     : $scheme . '://' . $_SERVER['HTTP_HOST'] . strtok($_SERVER['REQUEST_URI'], '?');
   $out = [];
+  $me = AUTH_ENABLE ? ($_SESSION['auth_user'] ?? null) : null;
+  $isAdmin = auth_is_admin();
   foreach ($db as $token => $entry) {
+    if (AUTH_ENABLE) {
+      if (!isset($entry['owner']) || $entry['owner'] !== $me) {
+        continue;
+      }
+    }
     $rel = norm_rel((string)($entry['path'] ?? ''));
     $exists = false;
     $type = 'file';
@@ -931,7 +2085,7 @@ if ($action === 'uploadInit') {
   if ($fileSize < 0 || $fileSize > MAX_UPLOAD_SIZE) jsend(['ok'=>false,'error'=>'Invalid size'], 400);
   if ($fileName === '') $fileName = 'file';
   $destAbs = abs_path($destDir);
-  ensure_inside_root($destAbs);
+  ensure_inside_allowed_roots($destAbs);
   if (!is_dir($destAbs)) jsend(['ok'=>false,'error'=>'Destination folder missing'], 400);
   $seed = $destDir . '|' . $relativePath . '|' . $fileName . '|' . $fileSize . '|' . $lastMod;
   $uploadId = rtrim(strtr(base64_encode(hash('sha256', $seed, true)), '+/', '-_'), '=');
@@ -1040,12 +2194,12 @@ if ($action === 'uploadFinalize') {
   $fileName = (string)($meta['fileName'] ?? 'file');
   $fileSize = (int)($meta['fileSize'] ?? 0);
   $destBaseAbs = abs_path($destDir);
-  ensure_inside_root($destBaseAbs);
+  ensure_inside_allowed_roots($destBaseAbs);
   if (!is_dir($destBaseAbs)) jsend(['ok'=>false,'error'=>'Destination missing'], 400);
   $finalDirAbs = $destBaseAbs;
   if ($relPath !== '') {
     $finalDirAbs = $destBaseAbs . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $relPath);
-    ensure_inside_root($finalDirAbs);
+    ensure_inside_allowed_roots($finalDirAbs);
     @mkdir($finalDirAbs, 0775, true);
   }
   $finalName = $fileName;
@@ -1102,128 +2256,5 @@ if ($action === 'uploadAbort') {
   }
   jsend(['ok'=>true]);
 }
-
-// --- DOWNLOAD PREPARE ---
-if ($action === 'downloadPrepare') {
-  set_time_limit(0);
-  downloads_gc();
-$paths = array_values(array_filter(
-  (array)($body['paths'] ?? []),
-  'is_string'
-));
-if ($paths) {
-  $absList = [];
-  foreach ($paths as $p) {
-    $r = norm_rel($p);
-    $a = abs_path($r);
-    ensure_inside_root($a);
-    if (file_exists($a)) $absList[] = $a;
-  }
-  if (!$absList) {
-    jsend(['ok'=>false,'error'=>'Nothing to zip'], 400);
-  }
-} else {
-  $rel = norm_rel((string)($body['path'] ?? ''));
-  $abs = abs_path($rel);
-  ensure_inside_root($abs);
-  if (!is_dir($abs)) {
-    jsend(['ok'=>true,'kind'=>'file']);
-  }
-  $absList = [$abs];
-}
-if ($paths) {
-  $folder = 'selection';
-} else {
-  $folder = basename($abs) ?: 'folder';
-  if ($folder === 'files') {
-    $folder = 'dl';
-  }
-}
-$tmpDir = STORAGE_DIR.'/tmp';
-if (!is_dir($tmpDir)) @mkdir($tmpDir, 0775, true);
-$tok = token(18);
-$tmp = "$tmpDir/dl_$tok.zip";
-try {
-  zip_cli($tmp, $absList);
-} catch (Throwable $e) {
-  @unlink($tmp);
-  jsend([
-    'ok' => false,
-    'error' => 'ZIP creation failed',
-    'detail' => $e->getMessage()
-  ], 500);
-}
-$db = downloads_db();
-$db[$tok] = [
-  'tmp' => $tmp,
-  'name' => ($folder ?? 'download') . '_' . bin2hex(random_bytes(6)) . '.zip',
-  'created' => time(),
-];
-downloads_save($db);
-jsend(['ok' => true, 'kind' => 'dir', 'token' => $tok, 'name' => $db[$tok]['name']]);
-}
-
-// --- DOWNLOAD ---
-if ($action === 'download') {
-  set_time_limit(0);
-  $dl = preg_replace('~[^a-zA-Z0-9_\-]~', '', (string)($_GET['dl'] ?? ''));
-if ($dl !== '') {
-  downloads_gc();
-  $db = downloads_db();
-  if (!isset($db[$dl])) { http_response_code(404); exit; }
-  $entry = $db[$dl];
-  $tmp = (string)($entry['tmp'] ?? '');
-  $name = (string)($entry['name'] ?? 'download.zip');
-  if ($tmp === '' || !is_file($tmp)) { http_response_code(404); exit; }
-  while (ob_get_level()) { ob_end_clean(); }
-  header('Content-Type: application/zip');
-  header('Content-Disposition: attachment; filename="'.rawurlencode($name).'"');
-  header('Content-Length: '.filesize($tmp));
-  header('X-Accel-Buffering: no');
-  readfile($tmp);
-  @unlink($tmp);
-  unset($db[$dl]);
-  downloads_save($db);
-  exit;
-}
-  $rel = norm_rel((string)($_GET['path'] ?? ''));
-  $abs = abs_path($rel);
-  ensure_inside_root($abs);
-  if (!file_exists($abs)) {
-    http_response_code(404);
-    exit;
-  }
-  while (ob_get_level()) { ob_end_clean(); }
-
-if (is_dir($abs)) {
-  $folderName = basename($abs) ?: 'folder';
-  $tmpDir = STORAGE_DIR . '/tmp';
-  if (!is_dir($tmpDir)) @mkdir($tmpDir, 0775, true);
-  $tmp = $tmpDir . '/folderzip_' . bin2hex(random_bytes(8)) . '.zip';
-  try {
-    zip_cli($tmp, [$abs]);
-  } catch (Throwable $e) {
-    http_response_code(500);
-    echo 'ZIP creation failed';
-    exit;
-  }
-  header('Content-Type: application/zip');
-  header('Content-Disposition: attachment; filename="'.rawurlencode($folderName).'.zip"');
-  header('Content-Length: '.filesize($tmp));
-  header('X-Accel-Buffering: no');
-  readfile($tmp);
-  @unlink($tmp);
-  exit;
-}
-
-    // --- File => stream as attachment ---
-    $mime = detect_mime($abs);
-    header('Content-Type: '.$mime);
-    header('Content-Disposition: attachment; filename="'.rawurlencode(basename($abs)).'"');
-    header('Content-Length: '.filesize($abs));
-    header('X-Accel-Buffering: no');
-    readfile($abs);
-    exit;
-  }
-  jsend(['ok'=>false,'error'=>'Unknown action'], 400);
+jsend(['ok'=>false,'error'=>'Unknown action'], 400);
 }
