@@ -209,7 +209,7 @@ function auth_require_or_render_login(): void {
     </div>
   </div>
 <div class="spacer"></div>
-<footer><?= htmlspecialchars(APP_TITLE) ?> V.1.2 © 2026 by Kevin Tobler - <a href='https://kevintobler.ch' target='_blank'>www.kevintobler.ch</a></footer>
+<footer><?= htmlspecialchars(APP_TITLE) ?> V.1.3 © 2026 by Kevin Tobler - <a href='https://kevintobler.ch' target='_blank'>www.kevintobler.ch</a></footer>
 </body>
 </html>
 <?php

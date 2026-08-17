@@ -783,7 +783,7 @@ if (isset($_GET['share'], $_GET['api'])) {
     if (!file_exists($abs) || !is_dir($abs)) {
       jsend(['ok'=>true,'items'=>[]]);
     }
-    ensure_inside_root($abs);
+    ensure_inside_share($abs, $absShared);
     $items = [];
     foreach (scandir($abs) as $n) {
       if ($n==='.' || $n==='..' || is_excluded_file($n)) continue;
@@ -816,7 +816,7 @@ if (isset($_GET['share'], $_GET['api'])) {
       if ($rel === '') exit;
       $abs = rtrim($absShared,'/').'/'.$rel;
     }
-    ensure_inside_root($abs);
+    ensure_inside_share($abs, $absShared);
     if (!is_file($abs)) exit;
     while (ob_get_level()) ob_end_clean();
     header('Content-Type: '.detect_mime($abs));
@@ -839,7 +839,21 @@ if (isset($_GET['share'], $_GET['api'])) {
   $cwd = norm_rel((string)($_GET['cwd'] ?? ''));
   $absList = [];
   $pathsIn = $_GET['paths'] ?? $_POST['paths'] ?? [];
-  foreach ((array)$pathsIn as $p) {
+  if (is_file($shareRoot)) {
+    if (!$pathsIn) {
+      jsend(['ok'=>false,'error'=>'Nothing to zip'], 400);
+    }
+    $sharedFile = realpath($shareRoot);
+    if ($sharedFile === false) {
+      jsend(['ok'=>false,'error'=>'Not found'], 404);
+    }
+    $absList[] = $sharedFile;
+    $zipBase = realpath(dirname($shareRoot));
+    if ($zipBase === false || !is_dir($zipBase)) {
+      jsend(['ok'=>false,'error'=>'Invalid ZIP base'], 400);
+    }
+  } else {
+    foreach ((array)$pathsIn as $p) {
       $rel = norm_rel(rawurldecode($p));
       if ($rel === '') continue;
       $abs = realpath(
@@ -848,14 +862,15 @@ if (isset($_GET['share'], $_GET['api'])) {
       if ($abs === false) continue;
       ensure_inside_share($abs, $shareRoot);
       $absList[] = $abs;
+    }
+    $zipBase = $shareRoot . ($cwd !== '' ? '/' . $cwd : '');
+    $zipBase = realpath($zipBase);
+    if ($zipBase === false || !is_dir($zipBase)) {
+      jsend(['ok'=>false,'error'=>'Invalid ZIP base'], 400);
+    }
   }
   if (!$absList) {
       jsend(['ok'=>false,'error'=>'Nothing to zip'], 400);
-  }
-  $zipBase = $shareRoot . ($cwd !== '' ? '/' . $cwd : '');
-  $zipBase = realpath($zipBase);
-  if ($zipBase === false || !is_dir($zipBase)) {
-      jsend(['ok'=>false,'error'=>'Invalid ZIP base'], 400);
   }
   $res = zip_create_job(
       $absList,
@@ -879,16 +894,16 @@ if (isset($_GET['share'], $_GET['api'])) {
 if (isset($_GET['share']) && !isset($_GET['api'])) {
   $t = preg_replace('~[^a-zA-Z0-9_\-]~', '', (string)$_GET['share']);
   $db = shares_db();
-  $shareRel = norm_rel($db[$t]['path']);
-  $shareAbs = abs_path($shareRel);
-  ensure_inside_root($shareAbs);
-  $shareBytes = share_total_size($shareAbs);
-  $shareSizeFormatted = format_bytes($shareBytes);
   if (!isset($db[$t])) {
     http_response_code(404);
     echo 'Share not found';
     exit;
   }
+  $shareRel = norm_rel($db[$t]['path']);
+  $shareAbs = abs_path($shareRel);
+  ensure_inside_root($shareAbs);
+  $shareBytes = share_total_size($shareAbs);
+  $shareSizeFormatted = format_bytes($shareBytes);
   header('Content-Type: text/html; charset=utf-8');
 ?>
 <!doctype html>

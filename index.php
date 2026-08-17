@@ -381,7 +381,7 @@ $rootTotalSize = format_bytes(dir_total_size(''));
 </div>
 <div class="spacer"></div>
 <div class="toast" id="toast"></div>
-<footer><?= htmlspecialchars(APP_TITLE) ?> V.1.2 © 2026 by Kevin Tobler - <a href='https://kevintobler.ch' target='_blank'>www.kevintobler.ch</a></footer>
+<footer><?= htmlspecialchars(APP_TITLE) ?> V.1.3 © 2026 by Kevin Tobler - <a href='https://kevintobler.ch' target='_blank'>www.kevintobler.ch</a></footer>
 <script>
   window.APP_CONFIG = { CHUNK_SIZE: <?= (int)CHUNK_SIZE_DEFAULT ?> };
   window.IS_ADMIN = <?= auth_is_admin() ? 'true' : 'false' ?>;
