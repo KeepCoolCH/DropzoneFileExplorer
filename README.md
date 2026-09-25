@@ -1,13 +1,15 @@
 # 📤 Dropzone File Explorer
 
 **Dropzone File Explorer** is a simple, self-hosted file manager designed for performance, usability and security. It allows you to browse, upload, manage and share files directly in the browser – without a database and without external dependencies.
-Version **1.3** – developed by Kevin Tobler 🌐 [www.kevintobler.ch](https://www.kevintobler.ch) – 🌐 [github.com/KeepCoolCH/DropzoneFileExplorer](https://github.com/KeepCoolCH/DropzoneFileExplorer) – 🌐 [hub.docker.com/r/keepcoolch/dropzonefileexplorer](https://hub.docker.com/r/keepcoolch/dropzonefileexplorer)
+Version **1.4** – developed by Kevin Tobler 🌐 [www.kevintobler.ch](https://www.kevintobler.ch) – 🌐 [github.com/KeepCoolCH/DropzoneFileExplorer](https://github.com/KeepCoolCH/DropzoneFileExplorer) – 🌐 [hub.docker.com/r/keepcoolch/dropzonefileexplorer](https://hub.docker.com/r/keepcoolch/dropzonefileexplorer)
 
 ---
 
 ## 🔄 Changelog
 
 ### 🆕 Version 1.x
+- **1.4**
+  - Security fix: enforce root containment for admins and reject ZIP symlinks, thanks to Dutch (dutchypoo) for the report
 - **1.3**
   - 🔗 Share ZIP download fixes for single-file shares
 - **1.2**
@@ -55,9 +57,9 @@ Version **1.3** – developed by Kevin Tobler 🌐 [www.kevintobler.ch](https:/
 
 ---
 
-## 🐳 Docker Installation (Version 1.3)
+## 🐳 Docker Installation (Version 1.4)
 
-Dropzone File Explorer **V.1.3** is available as a Docker image:
+Dropzone File Explorer **V.1.4** is available as a Docker image:
 
 ```bash
 docker pull keepcoolch/dropzonefileexplorer:latest

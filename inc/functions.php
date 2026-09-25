@@ -194,7 +194,6 @@ function realpath_first_existing(string $path): string|false {
 }
 
 function ensure_inside_allowed_roots(string $abs): void {
-  if (auth_is_admin()) return;
   $rootAbs = realpath(ROOT_DIR);
   if ($rootAbs === false) {
     jsend(['ok'=>false,'error'=>'Root missing'], 500);
@@ -208,10 +207,11 @@ function ensure_inside_allowed_roots(string $abs): void {
   if (strpos($abs, $rootAbs) !== 0) {
     jsend(['ok'=>false,'error'=>'Access denied'], 403);
   }
+  if (auth_is_admin()) return;
   $rel = norm_rel(substr($abs, strlen($rootAbs)));
   foreach (user_allowed_roots() as $rootRel) {
     $rootRel = rtrim($rootRel, '/');
-    if ($rel === $rootRel) {
+    if ($rootRel === '' || $rel === $rootRel) {
       return;
     }
     if (str_starts_with($rel.'/', $rootRel.'/')) {
@@ -238,7 +238,6 @@ function ensure_write_allowed(string $rel): void {
 }
 
 function ensure_target_inside_allowed_roots(string $absTarget): void {
-  if (auth_is_admin()) return;
   $root = realpath(ROOT_DIR);
   if ($root === false) {
     jsend(['ok'=>false,'error'=>'Root missing'], 500);
@@ -246,7 +245,7 @@ function ensure_target_inside_allowed_roots(string $absTarget): void {
   $root = rtrim($root, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
   $probe = $absTarget;
   while (true) {
-    if (file_exists($probe)) {
+    if (file_exists($probe) || is_link($probe)) {
       ensure_inside_allowed_roots($probe);
       return;
     }
@@ -429,6 +428,7 @@ function has_dir_children(string $rel): bool {
 }
 
 function rrmdir(string $dir): bool {
+  if (is_link($dir) || is_file($dir)) return @unlink($dir);
   if (!is_dir($dir)) return false;
   $it = new RecursiveIteratorIterator(
     new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS),
@@ -436,7 +436,7 @@ function rrmdir(string $dir): bool {
   );
   foreach ($it as $file) {
     $path = $file->getPathname();
-    if ($file->isDir()) {
+    if ($file->isDir() && !$file->isLink()) {
       if (!@rmdir($path)) return false;
     } else {
       if (!@unlink($path)) return false;
@@ -460,6 +460,8 @@ function tmp_gc(int $maxAge = 3600): void {
 }
 
 function rrcopy(string $src, string $dst): void {
+  ensure_inside_allowed_roots($src);
+  ensure_target_inside_allowed_roots($dst);
   if (is_dir($src)) {
     @mkdir($dst, 0775, true);
     $it = new DirectoryIterator($src);
@@ -964,7 +966,7 @@ if (isset($_GET['share']) && !isset($_GET['api'])) {
   </div>
 </div>
 <div class="spacer"></div>
-<footer class="share-view"><?= htmlspecialchars(APP_TITLE) ?> V.1.1 © 2026 by Kevin Tobler - <a href='https://kevintobler.ch' target='_blank'>www.kevintobler.ch</a></footer>
+<footer class="share-view"><?= htmlspecialchars(APP_TITLE) ?> V.1.4 © 2026 by Kevin Tobler - <a href='https://kevintobler.ch' target='_blank'>www.kevintobler.ch</a></footer>
 <script>
 const token = <?= json_encode($t) ?>;
 let cwd = null;
@@ -1303,9 +1305,7 @@ function dir_total_size(string $rel = ''): int {
     if ($rel === '' && !auth_is_admin()) {
       return 0;
     }
-    if (!auth_is_admin()) {
-      ensure_inside_allowed_roots($abs);
-    }
+    ensure_inside_allowed_roots($abs);
     $total = 0;
     $it = new RecursiveIteratorIterator(
         new RecursiveDirectoryIterator(
@@ -1891,6 +1891,7 @@ if ($action === 'unzip') {
     jsend(['ok'=>false,'error'=>'Not a file'], 400);
   }
   ensure_write_allowed($dest);
+  ensure_target_inside_allowed_roots($destAbs);
   if (!is_dir($destAbs) && !@mkdir($destAbs, 0775, true)) {
     jsend(['ok'=>false,'error'=>'Cannot create destination'], 500);
   }
@@ -1917,6 +1918,17 @@ if ($action === 'unzip') {
       jsend(['ok'=>false,'error'=>'Unsafe ZIP paths detected'], 400);
     }
   }
+  exec('unzip -Z -l ' . escapeshellarg($zipAbs) . ' 2>&1', $attributes, $rc);
+  if ($rc !== 0) {
+    rrmdir($tmpBase);
+    jsend(['ok'=>false,'error'=>'ZIP metadata check failed'], 400);
+  }
+  foreach ($attributes as $line) {
+    if (preg_match('/^[bclps][rwxstST?\-]{9}\s/', $line)) {
+      rrmdir($tmpBase);
+      jsend(['ok'=>false,'error'=>'ZIP links and special files are not allowed'], 400);
+    }
+  }
   $cmd = 'unzip -o ' . escapeshellarg($zipAbs)
        . ' -d ' . escapeshellarg($tmpBase) . ' 2>&1';
   exec($cmd, $out, $rc);
@@ -1924,6 +1936,18 @@ if ($action === 'unzip') {
     rrmdir($tmpBase);
     jsend(['ok'=>false,'error'=>'Unzip failed'], 500);
   }
+  $extracted = new RecursiveIteratorIterator(
+    new RecursiveDirectoryIterator($tmpBase, FilesystemIterator::SKIP_DOTS),
+    RecursiveIteratorIterator::SELF_FIRST
+  );
+  foreach ($extracted as $entry) {
+    if ($entry->isLink() || (!$entry->isDir() && !$entry->isFile())) {
+      unset($extracted);
+      rrmdir($tmpBase);
+      jsend(['ok'=>false,'error'=>'ZIP links and special files are not allowed'], 400);
+    }
+  }
+  unset($extracted);
   $topItems = [];
   foreach (scandir($tmpBase) as $i) {
     if ($i === '.' || $i === '..') continue;
@@ -1937,6 +1961,7 @@ if ($action === 'unzip') {
   foreach ($topItems as $item) {
     $src = $tmpBase . '/' . $item;
     $dst = $destAbs . '/' . $item;
+    ensure_target_inside_allowed_roots($dst);
     if (file_exists($dst)) {
       if ($policy === 'ask') {
         rrmdir($tmpBase);
